@@ -21,3 +21,11 @@ hardcoded values, and should not assume a default subscription is already set â€
 ### storage
 
 _No scripts yet._
+
+### pim
+
+- [`pim/az-pim-activate.sh`](pim/az-pim-activate.sh) â€” Interactively lists the signed-in
+  user's eligible Azure PIM resource-role assignments (direct and group-derived) across
+  accessible subscriptions and submits a self-activation request. Uses `fzf` for a
+  searchable menu when available, falls back to a numbered menu otherwise. Supports
+  `--dry-run` to preview the activation request without submitting it.
