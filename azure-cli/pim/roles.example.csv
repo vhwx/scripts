@@ -1,0 +1,17 @@
+# Sample batch input for az-pim-activate.sh --input-file
+#
+# One "role,scope" pair per line. Blank lines and lines starting with # are ignored.
+# "scope" may be a subscription ID, a subscription display name, or a full ARM scope
+# path (as shown in the interactive menu's SCOPE/SUBSCRIPTION columns) — whatever
+# uniquely identifies one of your eligible assignments.
+#
+# --duration and --justification (both optional on the command line) apply to every
+# line in the file. If --duration is omitted, batch mode defaults to PT4H.
+#
+# Example usage:
+#   ./az-pim-activate.sh --input-file roles.example.csv --justification "Planned maintenance"
+#   ./az-pim-activate.sh --input-file roles.example.csv --dry-run
+
+Owner,Example-Sandbox-Subscription
+Contributor,01b0eec7-4e50-47fb-9b3b-47706b34e504
+Reader,/subscriptions/5ee6cda2-0d58-492b-982e-65cf7b449ecc/resourceGroups/example-rg

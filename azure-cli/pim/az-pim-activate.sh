@@ -9,11 +9,16 @@
 #               therefore never appear in `az account list`. Lets you pick an
 #               assignment via fzf (if installed) or a numbered menu, then submits a
 #               self-activation request via the ARM REST API, prefilling a default
-#               justification so activation is a single keypress away.
+#               justification so activation is a single keypress away. Also supports
+#               a batch mode (--input-file) that activates a list of role/scope pairs
+#               from a file in one run, using a single duration and justification for
+#               all of them.
 # Usage:        ./az-pim-activate.sh
 #               ./az-pim-activate.sh --duration PT4H
 #               ./az-pim-activate.sh --justification "Planned maintenance"
 #               ./az-pim-activate.sh --subscription <subscription-id-or-name>
+#               ./az-pim-activate.sh --input-file roles.csv
+#               ./az-pim-activate.sh --input-file roles.csv --yes
 #               ./az-pim-activate.sh --dry-run
 #               Run with -h/--help for the full option list.
 # Requirements: Azure CLI (logged in via `az login`), jq. fzf is optional but gives a
@@ -28,14 +33,25 @@
 # NOTE: This script intentionally uses `set -u` plus explicit `||` error checks rather
 # than `set -e`, because several steps (fzf cancellation, optional az/jq lookups with
 # graceful fallbacks) rely on inspecting exit codes without aborting the whole script.
+#
+# NOTE: `az rest` resolves any subscription ID found in the URL against the *local*
+# `az account list` cache and refuses client-side with "Subscription '...' not found"
+# if it isn't cached there — which is common for PIM-eligible-only subscriptions
+# (no standing access means they never show up in `az account list`). This script
+# works around it by acquiring an ARM bearer token once up front and passing it
+# explicitly via an Authorization header, bypassing that local lookup entirely.
 
 set -u
 
 API_VERSION="2020-10-01"
 DURATION="PT1H"
+DURATION_SET_BY_USER="false"
+BATCH_DEFAULT_DURATION="PT4H"
 JUSTIFICATION=""
 DEFAULT_JUSTIFICATION="Self-activated via az-pim-activate.sh"
 SUBSCRIPTION_FILTER=""
+INPUT_FILE=""
+AUTO_CONFIRM="false"
 DRY_RUN="false"
 KEEP_CONTEXT="false"
 
@@ -49,10 +65,15 @@ Usage:
 
 Options:
   --subscription ID|NAME  Only show/activate assignments in this subscription
-  --duration ISO8601      Requested activation duration, default: PT1H
+  --duration ISO8601      Requested activation duration, default: PT1H (single mode),
+                           ${BATCH_DEFAULT_DURATION} (batch mode via --input-file)
   --justification TEXT    Activation justification, default: "${DEFAULT_JUSTIFICATION}"
+  --input-file PATH       Batch mode: activate every role/scope pair listed in PATH
+                           instead of prompting interactively. See "Batch file format"
+                           below. --duration and --justification apply to every line.
+  --yes                   Batch mode only: skip the confirmation prompt
   --keep-context          Do not switch az CLI to the selected subscription
-  --dry-run               Show the activation request without submitting it
+  --dry-run               Show the activation request(s) without submitting them
   -h, --help              Show this help
 
 Duration examples:
@@ -61,11 +82,23 @@ Duration examples:
   PT4H                    4 hours
   PT8H                    8 hours
 
+Batch file format (used with --input-file):
+  One "role,scope" pair per line. Blank lines and lines starting with # are ignored.
+  "scope" may be a subscription ID, a subscription display name, or a full ARM scope
+  path (as shown in the interactive menu's SCOPE/SUBSCRIPTION columns) — whatever
+  uniquely identifies one of your eligible assignments.
+
+    # role,scope
+    Owner,Example-Sandbox-Subscription
+    Contributor,01b0eec7-4e50-47fb-9b3b-47706b34e504
+    Reader,/subscriptions/5ee6cda2-0d58-492b-982e-65cf7b449ecc/resourceGroups/example-network-rg
+
 Examples:
   ${PROGRAM_NAME}
   ${PROGRAM_NAME} --duration PT4H
   ${PROGRAM_NAME} --justification "Troubleshooting production issue"
   ${PROGRAM_NAME} --subscription 00000000-0000-0000-0000-000000000000
+  ${PROGRAM_NAME} --input-file roles.csv --justification "Planned maintenance window"
 EOF
 }
 
@@ -108,6 +141,93 @@ make_uuid() {
 iso_utc_now() {
     # This format works with both BSD date on macOS and GNU date on Linux.
     date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# Builds and submits (or, in dry-run mode, prints) one PIM self-activation request.
+# Args: scope roleDefinitionId eligibilityScheduleId duration justification condition
+#       conditionVersion
+# On success, sets ACTIVATION_STATUS and ACTIVATION_REQUEST_NAME/ID; on failure, sets
+# ACTIVATION_STATUS="Failed" and ACTIVATION_ERROR, and returns non-zero. Shared by both
+# the interactive single-selection flow and --input-file batch mode.
+submit_activation() {
+    act_scope="$1"
+    act_role_definition_id="$2"
+    act_eligibility_schedule_id="$3"
+    act_duration="$4"
+    act_justification="$5"
+    act_condition="$6"
+    act_condition_version="$7"
+
+    act_request_id=$(make_uuid)
+    act_start_time=$(iso_utc_now)
+
+    act_body=$(
+        jq -n \
+            --arg principalId "$PRINCIPAL_ID" \
+            --arg roleDefinitionId "$act_role_definition_id" \
+            --arg eligibilityScheduleId "$act_eligibility_schedule_id" \
+            --arg startDateTime "$act_start_time" \
+            --arg duration "$act_duration" \
+            --arg justification "$act_justification" \
+            --arg condition "$act_condition" \
+            --arg conditionVersion "$act_condition_version" \
+            '
+            {
+              properties: {
+                principalId: $principalId,
+                requestType: "SelfActivate",
+                roleDefinitionId: $roleDefinitionId,
+                linkedRoleEligibilityScheduleId:
+                    $eligibilityScheduleId,
+                justification: $justification,
+                scheduleInfo: {
+                  startDateTime: $startDateTime,
+                  expiration: {
+                    type: "AfterDuration",
+                    duration: $duration
+                  }
+                }
+              }
+            }
+            | if $condition != "" then
+                .properties.condition = $condition
+              else
+                .
+              end
+            | if $conditionVersion != "" then
+                .properties.conditionVersion = $conditionVersion
+              else
+                .
+              end
+            '
+    )
+
+    act_uri="https://management.azure.com${act_scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${act_request_id}?api-version=${API_VERSION}"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        printf 'PUT %s\n\n' "$act_uri"
+        printf '%s\n' "$act_body" | jq .
+        ACTIVATION_STATUS="DryRun"
+        return 0
+    fi
+
+    if ! act_response=$(
+        az rest \
+            --method PUT \
+            --uri "$act_uri" \
+            --headers "@${AUTH_HEADER_FILE}" 'Content-Type=application/json' \
+            --body "$act_body" \
+            --output json 2>"${TMP_DIR}/activation-error.log"
+    ); then
+        ACTIVATION_STATUS="Failed"
+        ACTIVATION_ERROR=$(cat "${TMP_DIR}/activation-error.log")
+        return 1
+    fi
+
+    ACTIVATION_STATUS=$(printf '%s' "$act_response" | jq -r '.properties.status // "Unknown"')
+    ACTIVATION_REQUEST_NAME=$(printf '%s' "$act_response" | jq -r '.name // empty')
+    ACTIVATION_REQUEST_ID="$act_request_id"
+    return 0
 }
 
 scope_type() {
@@ -164,12 +284,22 @@ while [ "$#" -gt 0 ]; do
         --duration)
             [ "$#" -ge 2 ] || die "--duration requires a value"
             DURATION="$2"
+            DURATION_SET_BY_USER="true"
             shift 2
             ;;
         --justification)
             [ "$#" -ge 2 ] || die "--justification requires a value"
             JUSTIFICATION="$2"
             shift 2
+            ;;
+        --input-file)
+            [ "$#" -ge 2 ] || die "--input-file requires a value"
+            INPUT_FILE="$2"
+            shift 2
+            ;;
+        --yes)
+            AUTO_CONFIRM="true"
+            shift
             ;;
         --keep-context)
             KEEP_CONTEXT="true"
@@ -189,6 +319,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ -n "$INPUT_FILE" ] && [ "$DURATION_SET_BY_USER" != "true" ]; then
+    DURATION="$BATCH_DEFAULT_DURATION"
+fi
+
 case "$DURATION" in
     P*)
         ;;
@@ -196,6 +330,11 @@ case "$DURATION" in
         die "Duration must use ISO 8601 format, for example PT1H or PT30M."
         ;;
 esac
+
+if [ -n "$INPUT_FILE" ]; then
+    [ -r "$INPUT_FILE" ] ||
+        die "Input file not found or not readable: ${INPUT_FILE}"
+fi
 
 require_command az
 require_command jq
@@ -210,9 +349,29 @@ RAW_ASSIGNMENTS="${TMP_DIR}/raw-assignments.jsonl"
 ASSIGNMENTS="${TMP_DIR}/assignments.json"
 MENU="${TMP_DIR}/menu.tsv"
 SUBSCRIPTION_NAMES="${TMP_DIR}/subscription-names.json"
+AUTH_HEADER_FILE="${TMP_DIR}/auth-header.txt"
 
 : > "$RAW_ASSIGNMENTS"
 : > "$MENU"
+: > "$AUTH_HEADER_FILE"
+chmod 600 "$AUTH_HEADER_FILE"
+
+# Acquire an ARM bearer token once and reuse it (via an Authorization header) for every
+# `az rest` call below. See the NOTE near the top of this file: `az rest` otherwise
+# resolves any subscription ID in the URL against the local `az account list` cache and
+# fails client-side for subscriptions that aren't cached there — exactly the
+# PIM-eligible-only subscriptions this script needs to reach.
+ARM_TOKEN=$(
+    az account get-access-token \
+        --resource https://management.azure.com/ \
+        --query accessToken \
+        --output tsv 2>/dev/null
+) || die "Could not acquire an ARM access token. Run: az login"
+
+[ -n "$ARM_TOKEN" ] ||
+    die "Azure CLI returned an empty access token."
+
+printf 'Authorization=Bearer %s\n' "$ARM_TOKEN" > "$AUTH_HEADER_FILE"
 
 PRINCIPAL_ID=$(
     az ad signed-in-user show \
@@ -267,6 +426,7 @@ while [ -n "$URL" ]; do
     if ! az rest \
         --method GET \
         --uri "$URL" \
+        --headers "@${AUTH_HEADER_FILE}" \
         --output json > "$RESPONSE_FILE" 2>"${TMP_DIR}/error.log"; then
 
         ERROR_TEXT=$(cat "${TMP_DIR}/error.log")
@@ -328,7 +488,23 @@ if [ -n "$SUBSCRIPTION_FILTER" ]; then
             --subscription "$SUBSCRIPTION_FILTER" \
             --query id \
             --output tsv 2>/dev/null
-    ) || die "Subscription is unavailable: ${SUBSCRIPTION_FILTER}"
+    ) || true
+
+    if [ -z "$RESOLVED_SUBSCRIPTION_ID" ]; then
+        # `az account show` hits the same local-cache lookup as `az rest` (see the
+        # NOTE near the top of this file) and fails client-side for subscriptions the
+        # signed-in user has no standing access to. Accept the filter value as-is if
+        # it already looks like a subscription ID (four hyphens); it will simply match
+        # nothing below if it's wrong, producing a clear "no assignments found" error.
+        case "$SUBSCRIPTION_FILTER" in
+            *-*-*-*-*)
+                RESOLVED_SUBSCRIPTION_ID="$SUBSCRIPTION_FILTER"
+                ;;
+            *)
+                die "Subscription is unavailable: ${SUBSCRIPTION_FILTER}"
+                ;;
+        esac
+    fi
 
     FILTERED="${TMP_DIR}/assignments-filtered.json"
 
@@ -380,6 +556,163 @@ while [ "$INDEX" -lt "$ASSIGNMENT_COUNT" ]; do
 
     INDEX=$((INDEX + 1))
 done
+
+if [ -n "$INPUT_FILE" ]; then
+    # Batch mode: match each "role,scope" line in the input file against the
+    # discovered assignments, then activate all matches with one shared duration and
+    # justification. Batch mode never switches az CLI context (--keep-context is
+    # implied) since a batch can span multiple subscriptions.
+    PLAN="${TMP_DIR}/plan.tsv"
+    : > "$PLAN"
+    LINE_NUMBER=0
+    SKIPPED_COUNT=0
+
+    if [ -z "$JUSTIFICATION" ]; then
+        JUSTIFICATION="$DEFAULT_JUSTIFICATION"
+    fi
+
+    info ""
+    info "Batch mode: matching entries from ${INPUT_FILE}..."
+
+    while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
+        LINE_NUMBER=$((LINE_NUMBER + 1))
+
+        # Strip comments and surrounding whitespace; skip blank lines.
+        LINE=$(printf '%s' "$RAW_LINE" | sed 's/#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$LINE" ] || continue
+
+        LINE_ROLE=$(printf '%s' "$LINE" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        LINE_SCOPE=$(printf '%s' "$LINE" | cut -d',' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        if [ -z "$LINE_ROLE" ] || [ -z "$LINE_SCOPE" ]; then
+            warn "Line ${LINE_NUMBER}: expected \"role,scope\", got: ${RAW_LINE}"
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
+
+        MATCHES="${TMP_DIR}/matches.json"
+        jq \
+            --arg role "$LINE_ROLE" \
+            --arg scope "$LINE_SCOPE" \
+            '
+            (($role | ascii_downcase)) as $r
+            | (($scope | ascii_downcase)) as $s
+            | map(select(
+                (.roleDisplayName | ascii_downcase) == $r and
+                (
+                    (.scope | ascii_downcase) == $s or
+                    (.subscriptionId | ascii_downcase) == $s or
+                    ((.subscriptionName // "") | ascii_downcase) == $s or
+                    ((.scopeDisplayName // "") | ascii_downcase) == $s
+                )
+              ))
+            ' "$ASSIGNMENTS" > "$MATCHES"
+
+        MATCH_COUNT=$(jq 'length' "$MATCHES")
+
+        if [ "$MATCH_COUNT" -eq 0 ]; then
+            warn "Line ${LINE_NUMBER}: no eligible assignment found for role \"${LINE_ROLE}\" at scope \"${LINE_SCOPE}\"."
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
+
+        if [ "$MATCH_COUNT" -gt 1 ]; then
+            warn "Line ${LINE_NUMBER}: \"${LINE_ROLE}\" at \"${LINE_SCOPE}\" matches ${MATCH_COUNT} eligible assignments; use the full ARM scope path to disambiguate."
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+            continue
+        fi
+
+        printf '%s\n' "$(jq -c '.[0]' "$MATCHES")" >> "$PLAN"
+    done < "$INPUT_FILE"
+
+    PLAN_COUNT=$(wc -l < "$PLAN" | tr -d ' ')
+
+    if [ "$PLAN_COUNT" -eq 0 ]; then
+        die "No matching eligible assignments were found in ${INPUT_FILE}."
+    fi
+
+    info ""
+    info "Batch plan (${PLAN_COUNT} activation(s), ${SKIPPED_COUNT} line(s) skipped):"
+    info ""
+
+    PLAN_INDEX=0
+    while IFS= read -r PLAN_LINE; do
+        PLAN_INDEX=$((PLAN_INDEX + 1))
+        P_ROLE=$(printf '%s' "$PLAN_LINE" | jq -r '.roleDisplayName')
+        P_SCOPE=$(printf '%s' "$PLAN_LINE" | jq -r '.scope')
+        info "  ${PLAN_INDEX}) ${P_ROLE}  |  ${P_SCOPE}"
+    done < "$PLAN"
+
+    info ""
+    info "  Duration:      ${DURATION}"
+    info "  Justification: ${JUSTIFICATION}"
+
+    if [ "$DRY_RUN" = "true" ]; then
+        info ""
+        info "Dry run. No activation requests were submitted."
+
+        while IFS= read -r PLAN_LINE; do
+            P_SCOPE=$(printf '%s' "$PLAN_LINE" | jq -r '.scope')
+            P_ROLE_DEF_ID=$(printf '%s' "$PLAN_LINE" | jq -r '.roleDefinitionId')
+            P_ELIG_ID=$(printf '%s' "$PLAN_LINE" | jq -r '.eligibilityScheduleId')
+            P_CONDITION=$(printf '%s' "$PLAN_LINE" | jq -r '.condition // empty')
+            P_CONDITION_VERSION=$(printf '%s' "$PLAN_LINE" | jq -r '.conditionVersion // empty')
+
+            info ""
+            submit_activation \
+                "$P_SCOPE" "$P_ROLE_DEF_ID" "$P_ELIG_ID" \
+                "$DURATION" "$JUSTIFICATION" \
+                "$P_CONDITION" "$P_CONDITION_VERSION"
+        done < "$PLAN"
+
+        exit 0
+    fi
+
+    if [ "$AUTO_CONFIRM" != "true" ]; then
+        printf '\nActivate these %s assignment(s)? [y/N]: ' "$PLAN_COUNT" >&2
+        IFS= read -r CONFIRM
+        case "$CONFIRM" in
+            y|Y|yes|Yes) ;;
+            *) info "Aborted. No activation requests were submitted."; exit 0 ;;
+        esac
+    fi
+
+    SUCCESS_COUNT=0
+    FAILURE_COUNT=0
+
+    info ""
+    info "Submitting activation requests..."
+
+    PLAN_INDEX=0
+    while IFS= read -r PLAN_LINE; do
+        PLAN_INDEX=$((PLAN_INDEX + 1))
+        P_ROLE=$(printf '%s' "$PLAN_LINE" | jq -r '.roleDisplayName')
+        P_SCOPE=$(printf '%s' "$PLAN_LINE" | jq -r '.scope')
+        P_ROLE_DEF_ID=$(printf '%s' "$PLAN_LINE" | jq -r '.roleDefinitionId')
+        P_ELIG_ID=$(printf '%s' "$PLAN_LINE" | jq -r '.eligibilityScheduleId')
+        P_CONDITION=$(printf '%s' "$PLAN_LINE" | jq -r '.condition // empty')
+        P_CONDITION_VERSION=$(printf '%s' "$PLAN_LINE" | jq -r '.conditionVersion // empty')
+
+        if submit_activation \
+            "$P_SCOPE" "$P_ROLE_DEF_ID" "$P_ELIG_ID" \
+            "$DURATION" "$JUSTIFICATION" \
+            "$P_CONDITION" "$P_CONDITION_VERSION"; then
+            info "  [${PLAN_INDEX}/${PLAN_COUNT}] ${P_ROLE} @ ${P_SCOPE}: ${ACTIVATION_STATUS}"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        else
+            warn "[${PLAN_INDEX}/${PLAN_COUNT}] ${P_ROLE} @ ${P_SCOPE}: FAILED - ${ACTIVATION_ERROR}"
+            FAILURE_COUNT=$((FAILURE_COUNT + 1))
+        fi
+    done < "$PLAN"
+
+    info ""
+    info "Batch complete: ${SUCCESS_COUNT} succeeded, ${FAILURE_COUNT} failed."
+
+    [ "$FAILURE_COUNT" -eq 0 ] || exit 1
+
+    exit 0
+fi
+
 
 INDEX=0
 while [ "$INDEX" -lt "$ASSIGNMENT_COUNT" ]; do
@@ -515,84 +848,32 @@ fi
 [ -n "$JUSTIFICATION" ] ||
     die "A justification is required."
 
-REQUEST_ID=$(make_uuid)
-START_TIME=$(iso_utc_now)
-
-BODY=$(
-    jq -n \
-        --arg principalId "$PRINCIPAL_ID" \
-        --arg roleDefinitionId "$ROLE_DEFINITION_ID" \
-        --arg eligibilityScheduleId "$ELIGIBILITY_SCHEDULE_ID" \
-        --arg startDateTime "$START_TIME" \
-        --arg duration "$DURATION" \
-        --arg justification "$JUSTIFICATION" \
-        --arg condition "$CONDITION" \
-        --arg conditionVersion "$CONDITION_VERSION" \
-        '
-        {
-          properties: {
-            principalId: $principalId,
-            requestType: "SelfActivate",
-            roleDefinitionId: $roleDefinitionId,
-            linkedRoleEligibilityScheduleId:
-                $eligibilityScheduleId,
-            justification: $justification,
-            scheduleInfo: {
-              startDateTime: $startDateTime,
-              expiration: {
-                type: "AfterDuration",
-                duration: $duration
-              }
-            }
-          }
-        }
-        | if $condition != "" then
-            .properties.condition = $condition
-          else
-            .
-          end
-        | if $conditionVersion != "" then
-            .properties.conditionVersion = $conditionVersion
-          else
-            .
-          end
-        '
-)
-
-ACTIVATION_URI="https://management.azure.com${SCOPE}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${REQUEST_ID}?api-version=${API_VERSION}"
-
 if [ "$DRY_RUN" = "true" ]; then
     info ""
     info "Dry run. No activation request was submitted."
     info ""
-    printf 'PUT %s\n\n' "$ACTIVATION_URI"
-    printf '%s\n' "$BODY" | jq .
+    submit_activation \
+        "$SCOPE" "$ROLE_DEFINITION_ID" "$ELIGIBILITY_SCHEDULE_ID" \
+        "$DURATION" "$JUSTIFICATION" "$CONDITION" "$CONDITION_VERSION"
     exit 0
 fi
 
 info ""
 info "Submitting PIM activation request..."
 
-RESPONSE=$(
-    az rest \
-        --method PUT \
-        --uri "$ACTIVATION_URI" \
-        --headers 'Content-Type=application/json' \
-        --body "$BODY" \
-        --output json
-) || die "PIM activation request failed."
-
-STATUS=$(printf '%s' "$RESPONSE" | jq -r '.properties.status // "Unknown"')
-REQUEST_NAME=$(printf '%s' "$RESPONSE" | jq -r '.name // empty')
+submit_activation \
+    "$SCOPE" "$ROLE_DEFINITION_ID" "$ELIGIBILITY_SCHEDULE_ID" \
+    "$DURATION" "$JUSTIFICATION" "$CONDITION" "$CONDITION_VERSION" ||
+    die "PIM activation request failed: ${ACTIVATION_ERROR}"
 
 info ""
 info "Activation request submitted."
-info "  Request ID: ${REQUEST_NAME:-$REQUEST_ID}"
-info "  Status:     ${STATUS}"
+info "  Request ID: ${ACTIVATION_REQUEST_NAME:-$ACTIVATION_REQUEST_ID}"
+info "  Status:     ${ACTIVATION_STATUS}"
 info "  Role:       ${ROLE_NAME}"
 info "  Scope:      ${SCOPE}"
 
-case "$STATUS" in
+case "$ACTIVATION_STATUS" in
     Granted|Provisioned|Succeeded)
         info "  Result:     Access was activated."
         ;;
@@ -608,12 +889,20 @@ if [ "$KEEP_CONTEXT" != "true" ]; then
     if [ -z "$SELECTED_SUBSCRIPTION_ID" ]; then
         info ""
         info "Scope is not subscription-scoped; az CLI context left unchanged."
-    elif az account set \
-        --subscription "$SELECTED_SUBSCRIPTION_ID" 2>/dev/null; then
-        info ""
-        info "Azure CLI context changed to:"
-        info "  ${SELECTED_SUBSCRIPTION_NAME:-$SELECTED_SUBSCRIPTION_ID}"
     else
-        warn "Activation was submitted, but az account set failed."
+        # `az account set` only knows subscriptions in the local `az account list`
+        # cache. A subscription reached only through PIM eligibility (no prior
+        # standing access) won't be cached yet, so refresh the cache first — Azure
+        # now recognizes the subscription immediately after activation succeeds.
+        az account list --refresh --output none 2>/dev/null || true
+
+        if az account set --subscription "$SELECTED_SUBSCRIPTION_ID" 2>/dev/null; then
+            info ""
+            info "Azure CLI context changed to:"
+            info "  ${SELECTED_SUBSCRIPTION_NAME:-$SELECTED_SUBSCRIPTION_ID}"
+        else
+            warn "Activation was submitted, but az account set failed. Try: az account clear && az login, then az account set --subscription ${SELECTED_SUBSCRIPTION_ID}"
+        fi
     fi
 fi
+

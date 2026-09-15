@@ -29,5 +29,7 @@ _No scripts yet._
   in a single call — mirroring the Azure Portal's "My roles > Azure resources" view, including
   subscriptions the caller has no standing access to — and submits a self-activation request
   with a prefilled default justification. Uses `fzf` for a searchable menu when available,
-  falls back to a numbered menu otherwise. Supports `--subscription` to filter the list and
-  `--dry-run` to preview the activation request without submitting it.
+  falls back to a numbered menu otherwise. Supports `--subscription` to filter the list,
+  `--dry-run` to preview the activation request without submitting it, and `--input-file`
+  (see [`pim/roles.example.csv`](pim/roles.example.csv)) to batch-activate a list of
+  role/scope pairs with one shared duration (default `PT4H`) and justification.
