@@ -1,0 +1,19 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets — never commit real credentials, use placeholders instead
+*.pem
+*.key
+.env
+*.env.local
+azure-cli/**/*credentials*
+
+# Logs / scratch output from running scripts locally
+*.log
+/tmp/
