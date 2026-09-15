@@ -25,7 +25,9 @@ _No scripts yet._
 ### pim
 
 - [`pim/az-pim-activate.sh`](pim/az-pim-activate.sh) — Interactively lists the signed-in
-  user's eligible Azure PIM resource-role assignments (direct and group-derived) across
-  accessible subscriptions and submits a self-activation request. Uses `fzf` for a
-  searchable menu when available, falls back to a numbered menu otherwise. Supports
+  user's eligible Azure PIM resource-role assignments (direct and group-derived) tenant-wide
+  in a single call — mirroring the Azure Portal's "My roles > Azure resources" view, including
+  subscriptions the caller has no standing access to — and submits a self-activation request
+  with a prefilled default justification. Uses `fzf` for a searchable menu when available,
+  falls back to a numbered menu otherwise. Supports `--subscription` to filter the list and
   `--dry-run` to preview the activation request without submitting it.
