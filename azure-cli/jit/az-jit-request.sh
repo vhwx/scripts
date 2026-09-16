@@ -20,7 +20,9 @@
 #               single batch can mix SSH-only, RDP-only, and both-port targets. Use
 #               --configure to create/update a VM's JIT policy with a standard
 #               collection of IP ranges in the first place (this mode still refuses to
-#               set the policy itself to "*", since you control it directly here).
+#               set the policy itself to "*", since you control it directly here); the
+#               same --input-file "ip-ranges:" directive also doubles as the default
+#               --ip-ranges for --configure when it isn't given on the command line.
 # Usage:        ./az-jit-request.sh --subscription <id> --resource-group <rg> \
 #                   --vm-names vm1,vm2 [--ports 22,3389] [--duration PT1H]
 #               ./az-jit-request.sh --input-file vms.csv --dry-run
@@ -96,10 +98,11 @@ Options:
                             allowed request duration, default: ${DEFAULT_CONFIGURE_DURATION}
   --policy-name NAME      JIT policy name, default: ${DEFAULT_POLICY_NAME}
   --configure             Create/update the JIT policy instead of requesting access
-  --ip-ranges LIST        Configure mode only (required): comma-separated CIDRs/IPs to
-                            set as the allowed source IPs, e.g.
-                            203.0.113.0/24,198.51.100.10/32. Cannot be "*" — the whole
-                            point of this script is to avoid "Any" as the source.
+  --ip-ranges LIST        Configure mode only: comma-separated CIDRs/IPs to set as the
+                            allowed source IPs, e.g. 203.0.113.0/24,198.51.100.10/32.
+                            Cannot be "*" — the whole point of this script is to avoid
+                            "Any" as the source. Required unless --input-file declares
+                            an ip-ranges: directive, which is used as the fallback.
   --protocol PROTO        Configure mode only: port protocol, default: "*" (any)
   --yes                   Skip the confirmation prompt
   --dry-run               Show the request(s)/policy update(s) without submitting them
@@ -127,7 +130,9 @@ Input file format (used with --input-file):
   collection as the request's source IP instead of the port's JIT-configured ranges;
   leave it blank (or no/false/0) to keep using the JIT-configured ranges. A row that
   opts in without a directive present falls back to the JIT-configured ranges with a
-  warning.
+  warning. In --configure mode, this directive also doubles as the default for
+  --ip-ranges: if --ip-ranges isn't given on the command line, the directive's ranges
+  are used for every VM in the file (--ip-ranges, if given, always takes priority).
 
   An optional 5th column overrides which port(s) that row requests/configures, as a
   semicolon-separated list, e.g. "22" or "22;3389" (semicolons, not commas, since
@@ -298,11 +303,6 @@ case "$DURATION" in
         ;;
 esac
 
-if [ "$CONFIGURE" = "true" ]; then
-    [ -n "$IP_RANGES_RAW" ] ||
-        die "--configure requires --ip-ranges (a comma-separated list of CIDRs/IPs)."
-fi
-
 require_command az
 require_command jq
 
@@ -323,22 +323,11 @@ while IFS= read -r PORT_ITEM; do
     esac
 done < "$PORTS_FILE"
 
-# --- Collect and validate the IP range list (configure mode only) ---------------
+# --- Collect the IP range list (configure mode only; validated further below, once
+# the input file's optional "ip-ranges:" directive has also been read, so --configure
+# can fall back to it when --ip-ranges isn't given on the command line) ------------
 
 IP_RANGES_JSON='[]'
-
-if [ "$CONFIGURE" = "true" ]; then
-    IP_RANGES_FILE="${TMP_DIR}/ip-ranges.txt"
-    split_csv "$IP_RANGES_RAW" > "$IP_RANGES_FILE"
-    [ -s "$IP_RANGES_FILE" ] || die "--ip-ranges produced an empty list."
-
-    while IFS= read -r RANGE_ITEM; do
-        [ "$RANGE_ITEM" != "*" ] ||
-            die "--ip-ranges cannot be \"*\" (Any). Provide one or more real CIDRs/IPs, for example 203.0.113.0/24."
-    done < "$IP_RANGES_FILE"
-
-    IP_RANGES_JSON=$(jq -Rn '[inputs]' < "$IP_RANGES_FILE")
-fi
 
 az account show >/dev/null 2>&1 ||
     die "Azure CLI is not logged in. Run: az login"
@@ -463,6 +452,32 @@ else
 
         printf '%s\t%s\t%s\t%s\t%s\n' "$LINE_SUBSCRIPTION" "$LINE_RG" "$LINE_VM" "$LINE_USE_FILE_RANGES" "$LINE_PORTS" >> "$SPECS_FILE"
     done < "$INPUT_FILE"
+fi
+
+# --- Validate the IP range list now (configure mode only) -----------------------
+#
+# Deferred until here so that, with --input-file, --configure can fall back to the
+# file's "ip-ranges:" directive when --ip-ranges wasn't given on the command line.
+
+if [ "$CONFIGURE" = "true" ]; then
+    if [ -z "$IP_RANGES_RAW" ] && [ "$FILE_IP_RANGES_SET" = "true" ]; then
+        IP_RANGES_RAW="$FILE_IP_RANGES_RAW"
+        info "--configure: no --ip-ranges given; using the input file's ip-ranges directive (${IP_RANGES_RAW})."
+    fi
+
+    [ -n "$IP_RANGES_RAW" ] ||
+        die "--configure requires --ip-ranges (a comma-separated list of CIDRs/IPs), or an ip-ranges: directive in --input-file."
+
+    IP_RANGES_FILE="${TMP_DIR}/ip-ranges.txt"
+    split_csv "$IP_RANGES_RAW" > "$IP_RANGES_FILE"
+    [ -s "$IP_RANGES_FILE" ] || die "--ip-ranges produced an empty list."
+
+    while IFS= read -r RANGE_ITEM; do
+        [ "$RANGE_ITEM" != "*" ] ||
+            die "--ip-ranges cannot be \"*\" (Any). Provide one or more real CIDRs/IPs, for example 203.0.113.0/24."
+    done < "$IP_RANGES_FILE"
+
+    IP_RANGES_JSON=$(jq -Rn '[inputs]' < "$IP_RANGES_FILE")
 fi
 
 sort -u "$SPECS_FILE" -o "$SPECS_FILE"

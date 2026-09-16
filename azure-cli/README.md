@@ -42,8 +42,9 @@ _No scripts yet._
   it targets via a semicolon-separated 5th column (e.g. `22;3389`), falling back to
   the global `--ports` list otherwise. `--configure` creates/updates a VM's JIT policy
   with a standard collection of allowed source IP
-  ranges (via `--ip-ranges`, which also cannot be `*`) and a maximum request duration.
-  Supports
+  ranges (via `--ip-ranges`, which also cannot be `*`, or falling back to the input
+  file's `ip-ranges:` directive if `--ip-ranges` isn't given) and a maximum request
+  duration. Supports
   `--dry-run` to preview requests/policy updates without submitting them.
 
 ### pim
