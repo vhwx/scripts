@@ -621,7 +621,7 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
             VM_PORTS_FILE="${TMP_DIR}/vm-ports.json"
             jq -c \
                 --arg id "$VM_ID" \
-                '(.properties.virtualMachines // []) | map(select(.id == $id)) | .[0].ports // []' \
+                '(.properties.virtualMachines // []) | map(select((.id | ascii_downcase) == ($id | ascii_downcase))) | .[0].ports // []' \
                 "$POLICY_FILE" > "$VM_PORTS_FILE"
 
             if [ -n "$LINE_PORTS" ]; then
@@ -789,13 +789,16 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
 
         # Merge by VM id: if the same VM appears on more than one input-file row
         # (e.g. one row per port), union their ports instead of sending Azure two
-        # separate entries for the same VM id, which it rejects outright.
+        # separate entries for the same VM id, which it rejects outright. Matched
+        # case-insensitively, since Azure resource IDs are case-insensitive but the
+        # policy may already store a different letter-casing than `az vm show`
+        # returns for the same VM.
         NEW_VMS_JSON=$(
             jq -sc '
-                group_by(.id)
+                group_by(.id | ascii_downcase)
                 | map({
-                    id: .[0].id,
-                    ports: (map(.ports) | flatten | unique_by(.number))
+                    id: (.[-1].id),
+                    ports: (map(.ports) | flatten | group_by(.number) | map(.[-1]))
                   })
             ' "$GROUP_PLAN"
         )
@@ -807,14 +810,18 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                 --slurpfile existing "$POLICY_FILE" \
                 '
                 (($existing[0].properties.virtualMachines) // []) as $existingVms
-                | ($newVms | map(.id)) as $newIds
+                | ($existingVms + $newVms) as $combined
                 | {
                     kind: "Basic",
                     location: $location,
                     properties: {
                       virtualMachines: (
-                          ($existingVms | map(select((.id as $i | ($newIds | index($i))) | not)))
-                          + ($newVms | map({id: .id, ports: .ports}))
+                          $combined
+                          | group_by(.id | ascii_downcase)
+                          | map({
+                              id: (.[-1].id),
+                              ports: ((map(.ports) | flatten) | group_by(.number) | map(.[-1]))
+                            })
                       )
                     }
                   }
