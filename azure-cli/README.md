@@ -26,15 +26,16 @@ _No scripts yet._
 
 - [`jit/az-jit-request.sh`](jit/az-jit-request.sh) — Requests Microsoft Defender for
   Cloud just-in-time (JIT) VM access for SSH (22) and/or RDP (3389) on a given set of
-  virtual machines in one subscription/resource group. Reuses each VM's already
-  configured JIT source IP ranges as the request's source (the "IP configured in JIT
-  policy" option in the portal), refusing to request access for any port still set to
-  `*` (Any). Supports `--input-file` (see
-  [`jit/vms.example.txt`](jit/vms.example.txt)) to target a list of VM names, and
-  `--configure` to create/update a VM's JIT policy with a standard collection of
-  allowed source IP ranges (via `--ip-ranges`, which also cannot be `*`) and a maximum
-  request duration. Supports `--dry-run` to preview requests/policy updates without
-  submitting them.
+  virtual machines, which may span multiple subscriptions and resource groups in a
+  single run. Reuses each VM's already configured JIT source IP ranges as the
+  request's source (the "IP configured in JIT policy" option in the portal), refusing
+  to request access for any port still set to `*` (Any). Supports `--input-file` (see
+  [`jit/vms.example.csv`](jit/vms.example.csv), one `subscription,resource-group,vm-name`
+  entry per line) to target VMs across scopes, or `--vm-names` for a single
+  subscription/resource group. `--configure` creates/updates a VM's JIT policy with a
+  standard collection of allowed source IP ranges (via `--ip-ranges`, which also cannot
+  be `*`) and a maximum request duration. Supports `--dry-run` to preview
+  requests/policy updates without submitting them.
 
 ### pim
 

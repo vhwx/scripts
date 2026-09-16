@@ -3,37 +3,40 @@
 # Script:       az-jit-request.sh
 # Description:  Requests (or configures) Microsoft Defender for Cloud just-in-time (JIT)
 #               VM access for SSH (22) and/or RDP (3389) on a given set of virtual
-#               machines in one subscription/resource group. Mirrors the Azure Portal's
-#               VM "Connect > Request access" flow via the ARM REST API: it reads each
-#               VM's existing JIT policy, uses the source IP ranges already configured
-#               on that policy (the "JIT configured IPs" option in the portal's Source IP
-#               address field) as the allowed source for the access request, and refuses
-#               to request access for any port still configured with "*" (Any) — that
-#               source setting must be a real, restricted set of IP ranges. Use
-#               --configure to create/update a VM's JIT policy with that standard
-#               collection of IP ranges in the first place.
+#               machines, which may span multiple subscriptions and resource groups in
+#               a single run. Mirrors the Azure Portal's VM "Connect > Request access"
+#               flow via the ARM REST API: it reads each VM's existing JIT policy, uses
+#               the source IP ranges already configured on that policy (the "JIT
+#               configured IPs" option in the portal's Source IP address field) as the
+#               allowed source for the access request, and refuses to request access
+#               for any port still configured with "*" (Any) — that source setting must
+#               be a real, restricted set of IP ranges. Use --configure to create/update
+#               a VM's JIT policy with that standard collection of IP ranges in the
+#               first place.
 # Usage:        ./az-jit-request.sh --subscription <id> --resource-group <rg> \
 #                   --vm-names vm1,vm2 [--ports 22,3389] [--duration PT1H]
-#               ./az-jit-request.sh --subscription <id> --resource-group <rg> \
-#                   --input-file vms.txt --dry-run
+#               ./az-jit-request.sh --input-file vms.csv --dry-run
 #               ./az-jit-request.sh --subscription <id> --resource-group <rg> \
 #                   --vm-names vm1,vm2 --configure \
 #                   --ip-ranges 203.0.113.0/24,198.51.100.10/32 [--duration PT3H]
 #               Run with -h/--help for the full option list.
 # Requirements: Azure CLI (logged in via `az login`), jq. Microsoft Defender for Servers
-#               Plan 2 must be enabled on the subscription, and the target VMs must have
-#               a network security group (JIT does not support classic VMs). Requesting
-#               access needs Microsoft.Security/locations/jitNetworkAccessPolicies/*/read
-#               and .../initiate/action on the resource group; --configure additionally
+#               Plan 2 must be enabled on every subscription involved, and the target
+#               VMs must have a network security group (JIT does not support classic
+#               VMs). Requesting access needs
+#               Microsoft.Security/locations/jitNetworkAccessPolicies/*/read and
+#               .../initiate/action on each resource group; --configure additionally
 #               needs .../write and Microsoft.Compute/virtualMachines/write. Does not
-#               assume a default subscription — pass --subscription explicitly. Tested
-#               on macOS and Linux with Bash 3.2+.
+#               assume a default subscription or change the current az CLI context —
+#               every ARM call is made with an explicit subscription ID. Tested on
+#               macOS and Linux with Bash 3.2+.
 # Author:       Vegard Hoff Walmsness
 # Date:         2026-09-16
 #
 # NOTE: This script intentionally uses `set -u` plus explicit `||` error checks rather
-# than `set -e`, because several steps (missing VMs, unconfigured ports, optional
-# lookups) rely on inspecting exit codes/output without aborting the whole run.
+# than `set -e`, because several steps (missing VMs, unresolvable subscriptions,
+# unconfigured ports, optional lookups) rely on inspecting exit codes/output without
+# aborting the whole run.
 
 set -u
 
@@ -64,28 +67,34 @@ TMP_DIR=""
 usage() {
     cat <<EOF
 Usage:
-  ${PROGRAM_NAME} --subscription ID --resource-group RG [options] (--vm-names ... | --input-file PATH)
+  ${PROGRAM_NAME} --subscription ID --resource-group RG --vm-names LIST [options]
+  ${PROGRAM_NAME} --input-file PATH [options]
 
 Options:
-  --subscription ID        Subscription ID or name (required)
-  --resource-group RG      Resource group containing the VMs (required)
-  --vm-names LIST          Comma-separated VM names, e.g. vm1,vm2
-  --input-file PATH        One VM name per line instead of --vm-names. Blank lines and
-                             lines starting with # are ignored.
-  --ports LIST             Comma-separated TCP ports, default: ${DEFAULT_PORTS}
-  --duration ISO8601       Request mode: requested access duration, default:
-                             ${DEFAULT_REQUEST_DURATION}. Configure mode: maximum
-                             allowed request duration, default: ${DEFAULT_CONFIGURE_DURATION}
-  --policy-name NAME       JIT policy name, default: ${DEFAULT_POLICY_NAME}
-  --configure              Create/update the JIT policy instead of requesting access
-  --ip-ranges LIST         Configure mode only (required): comma-separated CIDRs/IPs to
-                             set as the allowed source IPs, e.g.
-                             203.0.113.0/24,198.51.100.10/32. Cannot be "*" — the whole
-                             point of this script is to avoid "Any" as the source.
-  --protocol PROTO         Configure mode only: port protocol, default: "*" (any)
-  --yes                    Skip the confirmation prompt
-  --dry-run                Show the request(s)/policy update(s) without submitting them
-  -h, --help               Show this help
+  --subscription ID|NAME  Subscription for --vm-names entries (required with --vm-names,
+                            not used with --input-file — see "Input file format" below)
+  --resource-group RG     Resource group for --vm-names entries (required with
+                            --vm-names, not used with --input-file)
+  --vm-names LIST         Comma-separated VM names within --subscription/--resource-group,
+                            e.g. vm1,vm2. Mutually exclusive with --input-file.
+  --input-file PATH       Batch mode: one "subscription,resource-group,vm-name" line per
+                            entry instead of --vm-names/--subscription/--resource-group.
+                            Lets a single run span multiple subscriptions and resource
+                            groups. See "Input file format" below.
+  --ports LIST            Comma-separated TCP ports, default: ${DEFAULT_PORTS}
+  --duration ISO8601      Request mode: requested access duration, default:
+                            ${DEFAULT_REQUEST_DURATION}. Configure mode: maximum
+                            allowed request duration, default: ${DEFAULT_CONFIGURE_DURATION}
+  --policy-name NAME      JIT policy name, default: ${DEFAULT_POLICY_NAME}
+  --configure             Create/update the JIT policy instead of requesting access
+  --ip-ranges LIST        Configure mode only (required): comma-separated CIDRs/IPs to
+                            set as the allowed source IPs, e.g.
+                            203.0.113.0/24,198.51.100.10/32. Cannot be "*" — the whole
+                            point of this script is to avoid "Any" as the source.
+  --protocol PROTO        Configure mode only: port protocol, default: "*" (any)
+  --yes                   Skip the confirmation prompt
+  --dry-run               Show the request(s)/policy update(s) without submitting them
+  -h, --help              Show this help
 
 Request mode (default) reads each VM's existing JIT policy and reuses whichever source
 IP ranges are already configured for the requested port(s) — this is the same as
@@ -93,12 +102,21 @@ selecting "IP configured in JIT policy" for the Source IP address field in the A
 Portal's request-access dialog. Ports still configured with "*" (Any) are skipped with
 an error; run --configure on them first.
 
+Input file format (used with --input-file):
+  One "subscription,resource-group,vm-name" entry per line. Blank lines and lines
+  starting with # are ignored. "subscription" may be a subscription ID or display name.
+  This is how a single run can target VMs across different subscriptions and resource
+  groups; --subscription/--resource-group are not used in this mode.
+
+    # subscription,resource-group,vm-name
+    Example-Sandbox-Subscription,example-rg,web-01
+    01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01
+
 Examples:
   ${PROGRAM_NAME} --subscription 00000000-0000-0000-0000-000000000000 \\
       --resource-group example-rg --vm-names web-01,web-02
 
-  ${PROGRAM_NAME} --subscription my-sub --resource-group example-rg \\
-      --input-file vms.txt --ports 3389 --duration PT2H
+  ${PROGRAM_NAME} --input-file vms.csv --ports 3389 --duration PT2H
 
   ${PROGRAM_NAME} --subscription my-sub --resource-group example-rg \\
       --vm-names web-01,web-02 --configure \\
@@ -207,9 +225,6 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$SUBSCRIPTION" ] || die "--subscription is required."
-[ -n "$RESOURCE_GROUP" ] || die "--resource-group is required."
-
 if [ -n "$VM_NAMES_RAW" ] && [ -n "$INPUT_FILE" ]; then
     die "Use either --vm-names or --input-file, not both."
 fi
@@ -218,7 +233,15 @@ if [ -z "$VM_NAMES_RAW" ] && [ -z "$INPUT_FILE" ]; then
     die "Provide VMs via --vm-names or --input-file."
 fi
 
+if [ -n "$VM_NAMES_RAW" ]; then
+    [ -n "$SUBSCRIPTION" ] || die "--subscription is required with --vm-names."
+    [ -n "$RESOURCE_GROUP" ] || die "--resource-group is required with --vm-names."
+fi
+
 if [ -n "$INPUT_FILE" ]; then
+    if [ -n "$SUBSCRIPTION" ] || [ -n "$RESOURCE_GROUP" ]; then
+        die "--subscription/--resource-group are not used with --input-file; specify them per line instead (see -h)."
+    fi
     [ -r "$INPUT_FILE" ] ||
         die "Input file not found or not readable: ${INPUT_FILE}"
 fi
@@ -284,44 +307,82 @@ fi
 az account show >/dev/null 2>&1 ||
     die "Azure CLI is not logged in. Run: az login"
 
-info "Setting subscription context to: ${SUBSCRIPTION}"
-az account set --subscription "$SUBSCRIPTION" ||
-    die "Could not set subscription context to: ${SUBSCRIPTION}"
+# --- Collect the VM specs: subscription, resource group, and VM name ------------
+#
+# Each row is "subscriptionRaw<TAB>resourceGroup<TAB>vmName". subscriptionRaw is
+# whatever the user/file provided (ID or display name) and is resolved to a
+# subscription ID below, once per distinct value.
 
-SUBSCRIPTION_ID=$(az account show --query id --output tsv 2>/dev/null) ||
-    die "Could not resolve the current subscription ID."
-
-# --- Collect the VM name list -----------------------------------------------------
-
-VM_NAMES_FILE="${TMP_DIR}/vm-names.txt"
-: > "$VM_NAMES_FILE"
+SPECS_FILE="${TMP_DIR}/vm-specs.tsv"
+: > "$SPECS_FILE"
 
 if [ -n "$VM_NAMES_RAW" ]; then
-    split_csv "$VM_NAMES_RAW" >> "$VM_NAMES_FILE"
+    while IFS= read -r VM_NAME; do
+        printf '%s\t%s\t%s\n' "$SUBSCRIPTION" "$RESOURCE_GROUP" "$VM_NAME" >> "$SPECS_FILE"
+    done < <(split_csv "$VM_NAMES_RAW")
 else
+    LINE_NUMBER=0
     while IFS= read -r RAW_LINE || [ -n "$RAW_LINE" ]; do
+        LINE_NUMBER=$((LINE_NUMBER + 1))
+
         LINE=$(printf '%s' "$RAW_LINE" | sed 's/#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -n "$LINE" ] || continue
-        printf '%s\n' "$LINE" >> "$VM_NAMES_FILE"
+
+        LINE_SUBSCRIPTION=$(printf '%s' "$LINE" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        LINE_RG=$(printf '%s' "$LINE" | cut -d',' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        LINE_VM=$(printf '%s' "$LINE" | cut -d',' -f3- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        if [ -z "$LINE_SUBSCRIPTION" ] || [ -z "$LINE_RG" ] || [ -z "$LINE_VM" ]; then
+            warn "Line ${LINE_NUMBER}: expected \"subscription,resource-group,vm-name\", got: ${RAW_LINE}"
+            continue
+        fi
+
+        printf '%s\t%s\t%s\n' "$LINE_SUBSCRIPTION" "$LINE_RG" "$LINE_VM" >> "$SPECS_FILE"
     done < "$INPUT_FILE"
 fi
 
-sort -u "$VM_NAMES_FILE" -o "$VM_NAMES_FILE"
-[ -s "$VM_NAMES_FILE" ] || die "No VM names were provided."
+sort -u "$SPECS_FILE" -o "$SPECS_FILE"
+[ -s "$SPECS_FILE" ] || die "No VM entries were provided."
 
-VM_COUNT=$(wc -l < "$VM_NAMES_FILE" | tr -d ' ')
-info "Resolving ${VM_COUNT} virtual machine(s) in resource group '${RESOURCE_GROUP}'..."
+SPEC_COUNT=$(wc -l < "$SPECS_FILE" | tr -d ' ')
+info "Resolving ${SPEC_COUNT} virtual machine(s)..."
+
+# --- Resolve each distinct subscription to a subscription ID --------------------
+
+SUB_CACHE_FILE="${TMP_DIR}/subscription-cache.tsv"
+: > "$SUB_CACHE_FILE"
+
+cut -f1 "$SPECS_FILE" | sort -u > "${TMP_DIR}/subscriptions.txt"
+
+while IFS= read -r SUB_RAW; do
+    SUB_ID=$(
+        az account show \
+            --subscription "$SUB_RAW" \
+            --query id \
+            --output tsv 2>/dev/null
+    ) || true
+
+    if [ -z "$SUB_ID" ]; then
+        warn "Subscription is unavailable, skipping its VM(s): ${SUB_RAW}"
+        continue
+    fi
+
+    printf '%s\t%s\n' "$SUB_RAW" "$SUB_ID" >> "$SUB_CACHE_FILE"
+done < "${TMP_DIR}/subscriptions.txt"
 
 # --- Resolve each VM to its resource ID and location -----------------------------
 
 RESOLVED_FILE="${TMP_DIR}/resolved.tsv"
 : > "$RESOLVED_FILE"
-MISSING_COUNT=0
 
-while IFS= read -r VM_NAME; do
+while IFS=$'\t' read -r SUB_RAW RG VM_NAME; do
+    SUB_ID=$(awk -F '\t' -v subv="$SUB_RAW" '$1 == subv {print $2; exit}' "$SUB_CACHE_FILE")
+    [ -n "$SUB_ID" ] || continue
+
     VM_INFO=$(
         az vm show \
-            --resource-group "$RESOURCE_GROUP" \
+            --subscription "$SUB_ID" \
+            --resource-group "$RG" \
             --name "$VM_NAME" \
             --query "{id:id, location:location}" \
             --output json 2>/dev/null
@@ -331,30 +392,30 @@ while IFS= read -r VM_NAME; do
     VM_LOCATION=$(printf '%s' "${VM_INFO:-}" | jq -r '.location // empty' 2>/dev/null)
 
     if [ -z "$VM_ID" ] || [ -z "$VM_LOCATION" ]; then
-        warn "VM not found in resource group '${RESOURCE_GROUP}': ${VM_NAME}"
-        MISSING_COUNT=$((MISSING_COUNT + 1))
+        warn "VM not found in subscription '${SUB_RAW}', resource group '${RG}': ${VM_NAME}"
         continue
     fi
 
-    printf '%s\t%s\t%s\n' "$VM_NAME" "$VM_ID" "$VM_LOCATION" >> "$RESOLVED_FILE"
-done < "$VM_NAMES_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$VM_NAME" "$VM_ID" "$VM_LOCATION" "$SUB_ID" "$RG" "$SUB_RAW" >> "$RESOLVED_FILE"
+done < "$SPECS_FILE"
 
 [ -s "$RESOLVED_FILE" ] ||
-    die "None of the requested VMs were found in resource group '${RESOURCE_GROUP}'."
+    die "None of the requested VMs could be resolved."
 
-# --- Build the plan, one location (JIT policy resource) at a time ---------------
+# --- Build the plan, one (subscription, resource group, location) group at a time -
 
 PLAN_FILE="${TMP_DIR}/plan.jsonl"
 : > "$PLAN_FILE"
 SKIPPED_COUNT=0
 
-LOCATIONS_FILE="${TMP_DIR}/locations.txt"
-cut -f3 "$RESOLVED_FILE" | sort -u > "$LOCATIONS_FILE"
+GROUPS_FILE="${TMP_DIR}/groups.tsv"
+cut -f3,4,5 "$RESOLVED_FILE" | sort -u > "$GROUPS_FILE"
 
-while IFS= read -r LOCATION; do
-    POLICY_URI="https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}?api-version=${API_VERSION}"
+while IFS=$'\t' read -r LOCATION SUB_ID RG; do
+    POLICY_URI="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}?api-version=${API_VERSION}"
 
-    POLICY_FILE="${TMP_DIR}/policy-${LOCATION}.json"
+    POLICY_FILE="${TMP_DIR}/policy-${SUB_ID}-${RG}-${LOCATION}.json"
 
     if az rest --method GET --uri "$POLICY_URI" --output json > "$POLICY_FILE" 2>/dev/null; then
         POLICY_EXISTS="true"
@@ -363,15 +424,20 @@ while IFS= read -r LOCATION; do
         echo '{"properties":{"virtualMachines":[]}}' > "$POLICY_FILE"
     fi
 
-    awk -F '\t' -v loc="$LOCATION" '$3 == loc {print $1"\t"$2}' "$RESOLVED_FILE" > "${TMP_DIR}/loc-vms.tsv"
+    awk -F '\t' -v loc="$LOCATION" -v subv="$SUB_ID" -v rg="$RG" \
+        '$3 == loc && $4 == subv && $5 == rg {print $1"\t"$2"\t"$6}' \
+        "$RESOLVED_FILE" > "${TMP_DIR}/group-vms.tsv"
 
     if [ "$CONFIGURE" = "true" ]; then
-        while IFS=$'\t' read -r VM_NAME VM_ID; do
+        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW; do
             printf '%s\n' \
                 "$(jq -nc \
                     --arg id "$VM_ID" \
                     --arg name "$VM_NAME" \
                     --arg location "$LOCATION" \
+                    --arg subscriptionId "$SUB_ID" \
+                    --arg subscriptionDisplay "$SUB_RAW" \
+                    --arg resourceGroup "$RG" \
                     --arg protocol "$PROTOCOL" \
                     --arg duration "$DURATION" \
                     --slurpfile ports "$PORTS_FILE" \
@@ -381,6 +447,9 @@ while IFS= read -r LOCATION; do
                       vmName: $name,
                       id: $id,
                       location: $location,
+                      subscriptionId: $subscriptionId,
+                      subscriptionDisplay: $subscriptionDisplay,
+                      resourceGroup: $resourceGroup,
                       ports: [
                         $ports[] as $p |
                         {
@@ -392,17 +461,17 @@ while IFS= read -r LOCATION; do
                       ]
                     }
                     ')" >> "$PLAN_FILE"
-        done < "${TMP_DIR}/loc-vms.tsv"
+        done < "${TMP_DIR}/group-vms.tsv"
     else
         if [ "$POLICY_EXISTS" != "true" ]; then
-            while IFS=$'\t' read -r VM_NAME VM_ID; do
-                warn "No JIT policy '${POLICY_NAME}' found for VM '${VM_NAME}' (location ${LOCATION}). Run with --configure first."
+            while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW; do
+                warn "No JIT policy '${POLICY_NAME}' found for VM '${VM_NAME}' (subscription ${SUB_RAW}, resource group ${RG}). Run with --configure first."
                 SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-            done < "${TMP_DIR}/loc-vms.tsv"
+            done < "${TMP_DIR}/group-vms.tsv"
             continue
         fi
 
-        while IFS=$'\t' read -r VM_NAME VM_ID; do
+        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW; do
             VM_PORTS_FILE="${TMP_DIR}/vm-ports.json"
             jq -c \
                 --arg id "$VM_ID" \
@@ -445,6 +514,9 @@ while IFS= read -r LOCATION; do
                     --arg id "$VM_ID" \
                     --arg name "$VM_NAME" \
                     --arg location "$LOCATION" \
+                    --arg subscriptionId "$SUB_ID" \
+                    --arg subscriptionDisplay "$SUB_RAW" \
+                    --arg resourceGroup "$RG" \
                     --arg duration "$DURATION" \
                     --argjson port "$REQ_PORT" \
                     --argjson prefixes "$PREFIXES" \
@@ -453,6 +525,9 @@ while IFS= read -r LOCATION; do
                       vmName: $name,
                       id: $id,
                       location: $location,
+                      subscriptionId: $subscriptionId,
+                      subscriptionDisplay: $subscriptionDisplay,
+                      resourceGroup: $resourceGroup,
                       ports: [
                         {
                           number: $port,
@@ -463,9 +538,9 @@ while IFS= read -r LOCATION; do
                     }
                     ' >> "$PLAN_FILE"
             done < "$PORTS_FILE"
-        done < "${TMP_DIR}/loc-vms.tsv"
+        done < "${TMP_DIR}/group-vms.tsv"
     fi
-done < "$LOCATIONS_FILE"
+done < "$GROUPS_FILE"
 
 PLAN_COUNT=$(wc -l < "$PLAN_FILE" | tr -d ' ')
 
@@ -485,15 +560,16 @@ info ""
 
 while IFS= read -r PLAN_LINE; do
     P_NAME=$(printf '%s' "$PLAN_LINE" | jq -r '.vmName')
-    P_LOCATION=$(printf '%s' "$PLAN_LINE" | jq -r '.location')
+    P_SUB=$(printf '%s' "$PLAN_LINE" | jq -r '.subscriptionDisplay')
+    P_RG=$(printf '%s' "$PLAN_LINE" | jq -r '.resourceGroup')
 
     if [ "$CONFIGURE" = "true" ]; then
         P_PORTS=$(printf '%s' "$PLAN_LINE" | jq -r '[.ports[].number] | join(",")')
-        info "  ${P_NAME} (${P_LOCATION}): ports ${P_PORTS} -> source ${IP_RANGES_RAW}, max duration ${DURATION}"
+        info "  ${P_NAME} (${P_SUB}/${P_RG}): ports ${P_PORTS} -> source ${IP_RANGES_RAW}, max duration ${DURATION}"
     else
         P_PORT=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].number')
         P_PREFIXES=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].allowedSourceAddressPrefixes | join(",")')
-        info "  ${P_NAME} (${P_LOCATION}): port ${P_PORT} -> source ${P_PREFIXES}, duration ${DURATION}"
+        info "  ${P_NAME} (${P_SUB}/${P_RG}): port ${P_PORT} -> source ${P_PREFIXES}, duration ${DURATION}"
     fi
 done < "$PLAN_FILE"
 
@@ -515,22 +591,25 @@ if [ "$DRY_RUN" != "true" ] && [ "$AUTO_CONFIRM" != "true" ]; then
     esac
 fi
 
-# --- Execute, one ARM call per location/policy resource --------------------------
+# --- Execute, one ARM call per (subscription, resource group, location) group ----
 
 SUCCESS_COUNT=0
 FAILURE_COUNT=0
 
-while IFS= read -r LOCATION; do
-    LOCATION_PLAN="${TMP_DIR}/location-plan-${LOCATION}.jsonl"
-    grep -F "\"location\":\"${LOCATION}\"" "$PLAN_FILE" > "$LOCATION_PLAN" 2>/dev/null || true
-    [ -s "$LOCATION_PLAN" ] || continue
+while IFS=$'\t' read -r LOCATION SUB_ID RG; do
+    GROUP_PLAN="${TMP_DIR}/group-plan-${SUB_ID}-${RG}-${LOCATION}.jsonl"
+    jq -c --arg sub "$SUB_ID" --arg rg "$RG" --arg loc "$LOCATION" \
+        'select(.subscriptionId == $sub and .resourceGroup == $rg and .location == $loc)' \
+        "$PLAN_FILE" > "$GROUP_PLAN"
+    [ -s "$GROUP_PLAN" ] || continue
 
-    POLICY_URI="https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}?api-version=${API_VERSION}"
+    POLICY_URI="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}?api-version=${API_VERSION}"
+    ERROR_LOG="${TMP_DIR}/error-${SUB_ID}-${RG}-${LOCATION}.log"
 
     if [ "$CONFIGURE" = "true" ]; then
-        POLICY_FILE="${TMP_DIR}/policy-${LOCATION}.json"
+        POLICY_FILE="${TMP_DIR}/policy-${SUB_ID}-${RG}-${LOCATION}.json"
 
-        NEW_VMS_JSON=$(jq -s '.' "$LOCATION_PLAN")
+        NEW_VMS_JSON=$(jq -s '.' "$GROUP_PLAN")
 
         MERGED_BODY=$(
             jq -n \
@@ -559,16 +638,16 @@ while IFS= read -r LOCATION; do
             continue
         fi
 
-        if az rest --method PUT --uri "$POLICY_URI" --body "$MERGED_BODY" --output none 2>"${TMP_DIR}/error-${LOCATION}.log"; then
-            LOCATION_VM_COUNT=$(printf '%s' "$NEW_VMS_JSON" | jq 'length')
-            info "Configured JIT policy '${POLICY_NAME}' at ${LOCATION} for ${LOCATION_VM_COUNT} VM(s)."
-            SUCCESS_COUNT=$((SUCCESS_COUNT + LOCATION_VM_COUNT))
+        if az rest --method PUT --uri "$POLICY_URI" --body "$MERGED_BODY" --output none 2>"$ERROR_LOG"; then
+            GROUP_VM_COUNT=$(printf '%s' "$NEW_VMS_JSON" | jq 'length')
+            info "Configured JIT policy '${POLICY_NAME}' at ${RG}/${LOCATION} for ${GROUP_VM_COUNT} VM(s)."
+            SUCCESS_COUNT=$((SUCCESS_COUNT + GROUP_VM_COUNT))
         else
-            warn "Failed to configure JIT policy at ${LOCATION}: $(cat "${TMP_DIR}/error-${LOCATION}.log")"
+            warn "Failed to configure JIT policy at ${RG}/${LOCATION}: $(cat "$ERROR_LOG")"
             FAILURE_COUNT=$((FAILURE_COUNT + $(printf '%s' "$NEW_VMS_JSON" | jq 'length')))
         fi
     else
-        INITIATE_URI="https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}/initiate?api-version=${API_VERSION}"
+        INITIATE_URI="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}/initiate?api-version=${API_VERSION}"
 
         REQUEST_BODY=$(
             jq -s \
@@ -578,7 +657,7 @@ while IFS= read -r LOCATION; do
                      ports: [.ports[0]]
                    })
                  }' \
-                "$LOCATION_PLAN"
+                "$GROUP_PLAN"
         )
 
         if [ "$DRY_RUN" = "true" ]; then
@@ -587,17 +666,17 @@ while IFS= read -r LOCATION; do
             continue
         fi
 
-        RESPONSE_FILE="${TMP_DIR}/initiate-response-${LOCATION}.json"
+        RESPONSE_FILE="${TMP_DIR}/initiate-response-${SUB_ID}-${RG}-${LOCATION}.json"
 
-        if az rest --method POST --uri "$INITIATE_URI" --body "$REQUEST_BODY" --output json > "$RESPONSE_FILE" 2>"${TMP_DIR}/error-${LOCATION}.log"; then
+        if az rest --method POST --uri "$INITIATE_URI" --body "$REQUEST_BODY" --output json > "$RESPONSE_FILE" 2>"$ERROR_LOG"; then
             jq -r '.virtualMachines[] as $vm | $vm.ports[] | "  \($vm.id | split("/") | last): port \(.number) -> \(.status // "Initiating") (\(.endTimeUtc // "n/a"))"' "$RESPONSE_FILE" >&2
             SUCCESS_COUNT=$((SUCCESS_COUNT + $(jq '[.virtualMachines[].ports[]] | length' "$RESPONSE_FILE")))
         else
-            warn "Failed to request JIT access at ${LOCATION}: $(cat "${TMP_DIR}/error-${LOCATION}.log")"
-            FAILURE_COUNT=$((FAILURE_COUNT + $(wc -l < "$LOCATION_PLAN" | tr -d ' ')))
+            warn "Failed to request JIT access at ${RG}/${LOCATION}: $(cat "$ERROR_LOG")"
+            FAILURE_COUNT=$((FAILURE_COUNT + $(wc -l < "$GROUP_PLAN" | tr -d ' ')))
         fi
     fi
-done < "$LOCATIONS_FILE"
+done < "$GROUPS_FILE"
 
 if [ "$DRY_RUN" = "true" ]; then
     exit 0

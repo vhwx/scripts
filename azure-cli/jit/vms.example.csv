@@ -1,0 +1,16 @@
+# Sample batch input for az-jit-request.sh --input-file
+#
+# One "subscription,resource-group,vm-name" entry per line. Blank lines and lines
+# starting with # are ignored. "subscription" may be a subscription ID or display name.
+# This lets a single run target VMs across different subscriptions and resource groups
+# — --subscription/--resource-group are not used in this mode.
+#
+# Example usage:
+#   ./az-jit-request.sh --input-file vms.example.csv --ports 22,3389 --dry-run
+#   ./az-jit-request.sh --input-file vms.example.csv --configure \
+#       --ip-ranges 203.0.113.0/24,198.51.100.10/32
+
+# subscription,resource-group,vm-name
+Example-Sandbox-Subscription,example-rg,web-01
+Example-Sandbox-Subscription,example-rg,web-02
+01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01
