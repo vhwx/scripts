@@ -8,16 +8,19 @@
 #               flow via the ARM REST API: by default it reads each VM's existing JIT
 #               policy and reuses the source IP ranges already configured on that
 #               policy (the "JIT configured IPs" option in the portal's Source IP
-#               address field) as the allowed source for the access request, refusing
-#               to request access for any port still configured with "*" (Any). An
-#               --input-file may also declare a standard collection of IP ranges once
-#               at the top (an "ip-ranges:" directive) and let individual VM rows opt
-#               into using it for their request instead of the policy's own ranges;
-#               rows that don't opt in keep using the JIT-configured ranges. Each
+#               address field) as the allowed source for the access request, including
+#               "*" (Any) if that's genuinely what the policy allows for a port you
+#               don't control the configuration of. An --input-file may also declare a
+#               standard collection of IP ranges once at the top (an "ip-ranges:"
+#               directive) and let individual VM rows opt into using it for their
+#               request instead of the policy's own ranges — this also lets you narrow
+#               a "*" (Any) policy port down to a real range you choose, since Azure
+#               always accepts a specific range as a valid subset of "*". Each
 #               input-file row may also override which port(s) it requests, so a
 #               single batch can mix SSH-only, RDP-only, and both-port targets. Use
 #               --configure to create/update a VM's JIT policy with a standard
-#               collection of IP ranges in the first place.
+#               collection of IP ranges in the first place (this mode still refuses to
+#               set the policy itself to "*", since you control it directly here).
 # Usage:        ./az-jit-request.sh --subscription <id> --resource-group <rg> \
 #                   --vm-names vm1,vm2 [--ports 22,3389] [--duration PT1H]
 #               ./az-jit-request.sh --input-file vms.csv --dry-run
@@ -105,9 +108,11 @@ Options:
 Request mode (default) reads each VM's existing JIT policy and reuses whichever source
 IP ranges are already configured for the requested port(s) — this is the same as
 selecting "IP configured in JIT policy" for the Source IP address field in the Azure
-Portal's request-access dialog. Ports still configured with "*" (Any) are skipped with
-an error unless the row opts into the file's ip-ranges (see below); run --configure on
-them first otherwise.
+Portal's request-access dialog. If a port is configured with "*" (Any) — for example
+on a VM you don't control the JIT policy of — the request is still submitted using
+"*" as-is (with a warning), or you can opt the row into the input file's ip-ranges
+directive (see below) to narrow the request down to a real range instead; Azure always
+accepts a specific range as a valid subset of a "*" policy.
 
 Input file format (used with --input-file):
   One "subscription,resource-group,vm-name[,use-file-ip-ranges][,ports]" entry per
@@ -626,7 +631,10 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
 
                 if [ "$USE_FILE_RANGES" = "true" ]; then
                     # Row opted into the input file's "ip-ranges:" directive: use it
-                    # as-is, regardless of what the policy itself has configured.
+                    # as-is, regardless of what the policy itself has configured. Any
+                    # specific range is a valid Azure-side subset of a "*" policy port,
+                    # so this also works to narrow down access on VMs whose policy is
+                    # intentionally left at "*" (Any).
                     PREFIXES="$FILE_IP_RANGES_JSON"
                 else
                     PREFIXES=$(
@@ -640,12 +648,22 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                         '
                     )
 
-                    HAS_WILDCARD=$(printf '%s' "$PREFIXES" | jq -r 'map(select(. == "*")) | length')
-
-                    if [ "$PREFIXES" = "[]" ] || [ "$HAS_WILDCARD" != "0" ]; then
-                        warn "VM '${VM_NAME}': port ${REQ_PORT} is configured with source IP \"*\" (Any). Refusing to request access — run --configure with real --ip-ranges first, or opt this row into the input file's ip-ranges directive."
+                    if [ "$PREFIXES" = "[]" ]; then
+                        warn "VM '${VM_NAME}': port ${REQ_PORT} has no source IP configured at all. Refusing to request access — run --configure first, or opt this row into the input file's ip-ranges directive."
                         SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
                         continue
+                    fi
+
+                    HAS_WILDCARD=$(printf '%s' "$PREFIXES" | jq -r 'map(select(. == "*")) | length')
+
+                    if [ "$HAS_WILDCARD" != "0" ]; then
+                        # The policy itself allows "*" (Any) for this port. We don't
+                        # control that policy, so request access using it as-is
+                        # (equivalent to selecting "IP configured in JIT policy" for a
+                        # VM whose owner has chosen "*"); use the input file's
+                        # ip-ranges directive on this row instead if you want to
+                        # narrow the request down to a custom range.
+                        warn "VM '${VM_NAME}': port ${REQ_PORT} is configured with source IP \"*\" (Any) in the JIT policy. Requesting access with \"*\" as-is — opt this row into the input file's ip-ranges directive to narrow it down instead."
                     fi
                 fi
 
