@@ -13,7 +13,9 @@
 #               --input-file may also declare a standard collection of IP ranges once
 #               at the top (an "ip-ranges:" directive) and let individual VM rows opt
 #               into using it for their request instead of the policy's own ranges;
-#               rows that don't opt in keep using the JIT-configured ranges. Use
+#               rows that don't opt in keep using the JIT-configured ranges. Each
+#               input-file row may also override which port(s) it requests, so a
+#               single batch can mix SSH-only, RDP-only, and both-port targets. Use
 #               --configure to create/update a VM's JIT policy with a standard
 #               collection of IP ranges in the first place.
 # Usage:        ./az-jit-request.sh --subscription <id> --resource-group <rg> \
@@ -84,7 +86,8 @@ Options:
                             entry instead of --vm-names/--subscription/--resource-group.
                             Lets a single run span multiple subscriptions and resource
                             groups. See "Input file format" below.
-  --ports LIST            Comma-separated TCP ports, default: ${DEFAULT_PORTS}
+  --ports LIST            Comma-separated TCP ports, default: ${DEFAULT_PORTS}. Can be
+                            overridden per row in --input-file (see below)
   --duration ISO8601      Request mode: requested access duration, default:
                             ${DEFAULT_REQUEST_DURATION}. Configure mode: maximum
                             allowed request duration, default: ${DEFAULT_CONFIGURE_DURATION}
@@ -107,11 +110,11 @@ an error unless the row opts into the file's ip-ranges (see below); run --config
 them first otherwise.
 
 Input file format (used with --input-file):
-  One "subscription,resource-group,vm-name[,use-file-ip-ranges]" entry per line. Blank
-  lines and lines starting with # are ignored. "subscription" may be a subscription ID
-  or display name. This is how a single run can target VMs across different
-  subscriptions and resource groups; --subscription/--resource-group are not used in
-  this mode.
+  One "subscription,resource-group,vm-name[,use-file-ip-ranges][,ports]" entry per
+  line. Blank lines and lines starting with # are ignored. "subscription" may be a
+  subscription ID or display name. This is how a single run can target VMs across
+  different subscriptions and resource groups; --subscription/--resource-group are
+  not used in this mode.
 
   An optional "ip-ranges: cidr[,cidr...]" directive line (anywhere in the file, but
   conventionally at the top) declares a standard collection of source IP ranges for
@@ -121,13 +124,18 @@ Input file format (used with --input-file):
   opts in without a directive present falls back to the JIT-configured ranges with a
   warning.
 
+  An optional 5th column overrides which port(s) that row requests/configures, as a
+  semicolon-separated list, e.g. "22" or "22;3389" (semicolons, not commas, since
+  commas are already the field separator). Leave it blank to use the global --ports
+  list. This lets a single input file mix SSH-only, RDP-only, and both-port targets.
+
     # Standard collection of IPs to request access from, shared by rows below
     ip-ranges: 203.0.113.0/24,198.51.100.10/32
 
-    # subscription,resource-group,vm-name,use-file-ip-ranges
-    Example-Sandbox-Subscription,example-rg,web-01,yes
-    Example-Sandbox-Subscription,example-rg,web-02
-    01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01
+    # subscription,resource-group,vm-name,use-file-ip-ranges,ports
+    Example-Sandbox-Subscription,example-rg,web-01,yes,22
+    Example-Sandbox-Subscription,example-rg,web-02,,3389
+    01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01,,22;3389
 
 Examples:
   ${PROGRAM_NAME} --subscription 00000000-0000-0000-0000-000000000000 \\
@@ -170,6 +178,12 @@ require_command() {
 # Splits a comma-separated list into one trimmed, non-empty item per line on stdout.
 split_csv() {
     printf '%s' "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
+}
+
+# Splits a semicolon-separated list (used for the input file's per-row "ports"
+# column, since commas are already the field delimiter there) the same way.
+split_semi() {
+    printf '%s' "$1" | tr ';' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
 }
 
 while [ "$#" -gt 0 ]; do
@@ -326,12 +340,14 @@ az account show >/dev/null 2>&1 ||
 
 # --- Collect the VM specs: subscription, resource group, and VM name ------------
 #
-# Each row is "subscriptionRaw<TAB>resourceGroup<TAB>vmName<TAB>useFileRanges".
+# Each row is "subscriptionRaw<TAB>resourceGroup<TAB>vmName<TAB>useFileRanges<TAB>linePorts".
 # subscriptionRaw is whatever the user/file provided (ID or display name) and is
 # resolved to a subscription ID below, once per distinct value. useFileRanges is
 # "true"/"false", set from the input file's optional per-row 4th column (see below);
 # --vm-names entries always get "false" since there is no file-level ip-ranges
-# directive outside of --input-file.
+# directive outside of --input-file. linePorts is a semicolon-separated list of ports
+# from the input file's optional per-row 5th column, or "" to use the global --ports
+# list; --vm-names entries always get "" since ports are already given via --ports.
 
 SPECS_FILE="${TMP_DIR}/vm-specs.tsv"
 : > "$SPECS_FILE"
@@ -345,7 +361,7 @@ FILE_IP_RANGES_SET="false"
 
 if [ -n "$VM_NAMES_RAW" ]; then
     while IFS= read -r VM_NAME; do
-        printf '%s\t%s\t%s\t%s\n' "$SUBSCRIPTION" "$RESOURCE_GROUP" "$VM_NAME" "false" >> "$SPECS_FILE"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$SUBSCRIPTION" "$RESOURCE_GROUP" "$VM_NAME" "false" "" >> "$SPECS_FILE"
     done < <(split_csv "$VM_NAMES_RAW")
 else
     LINE_NUMBER=0
@@ -394,9 +410,10 @@ else
         LINE_RG=$(printf '%s' "$LINE" | cut -d',' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         LINE_VM=$(printf '%s' "$LINE" | cut -d',' -f3 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         LINE_USE_RANGE_RAW=$(printf '%s' "$LINE" | cut -d',' -f4 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        LINE_PORTS_RAW=$(printf '%s' "$LINE" | cut -d',' -f5 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
         if [ -z "$LINE_SUBSCRIPTION" ] || [ -z "$LINE_RG" ] || [ -z "$LINE_VM" ]; then
-            warn "Line ${LINE_NUMBER}: expected \"subscription,resource-group,vm-name[,use-file-ip-ranges]\", got: ${RAW_LINE}"
+            warn "Line ${LINE_NUMBER}: expected \"subscription,resource-group,vm-name[,use-file-ip-ranges][,ports]\", got: ${RAW_LINE}"
             continue
         fi
 
@@ -416,7 +433,30 @@ else
                 ;;
         esac
 
-        printf '%s\t%s\t%s\t%s\n' "$LINE_SUBSCRIPTION" "$LINE_RG" "$LINE_VM" "$LINE_USE_FILE_RANGES" >> "$SPECS_FILE"
+        LINE_PORTS="$LINE_PORTS_RAW"
+        if [ -n "$LINE_PORTS_RAW" ]; then
+            LINE_PORTS_CHECK_FILE="${TMP_DIR}/line-ports-check.txt"
+            split_semi "$LINE_PORTS_RAW" > "$LINE_PORTS_CHECK_FILE"
+
+            if [ ! -s "$LINE_PORTS_CHECK_FILE" ]; then
+                warn "Line ${LINE_NUMBER}: VM '${LINE_VM}' has an empty ports override, using --ports instead."
+                LINE_PORTS=""
+            else
+                LINE_PORTS_INVALID="false"
+                while IFS= read -r LINE_PORT_ITEM; do
+                    case "$LINE_PORT_ITEM" in
+                        ''|*[!0-9]*)
+                            warn "Line ${LINE_NUMBER}: invalid port \"${LINE_PORT_ITEM}\" for VM '${LINE_VM}', using --ports instead."
+                            LINE_PORTS_INVALID="true"
+                            ;;
+                    esac
+                done < "$LINE_PORTS_CHECK_FILE"
+
+                [ "$LINE_PORTS_INVALID" = "false" ] || LINE_PORTS=""
+            fi
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\n' "$LINE_SUBSCRIPTION" "$LINE_RG" "$LINE_VM" "$LINE_USE_FILE_RANGES" "$LINE_PORTS" >> "$SPECS_FILE"
     done < "$INPUT_FILE"
 fi
 
@@ -454,7 +494,7 @@ done < "${TMP_DIR}/subscriptions.txt"
 RESOLVED_FILE="${TMP_DIR}/resolved.tsv"
 : > "$RESOLVED_FILE"
 
-while IFS=$'\t' read -r SUB_RAW RG VM_NAME USE_FILE_RANGES; do
+while IFS=$'\t' read -r SUB_RAW RG VM_NAME USE_FILE_RANGES LINE_PORTS; do
     SUB_ID=$(awk -F '\t' -v subv="$SUB_RAW" '$1 == subv {print $2; exit}' "$SUB_CACHE_FILE")
     [ -n "$SUB_ID" ] || continue
 
@@ -475,8 +515,8 @@ while IFS=$'\t' read -r SUB_RAW RG VM_NAME USE_FILE_RANGES; do
         continue
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$VM_NAME" "$VM_ID" "$VM_LOCATION" "$SUB_ID" "$RG" "$SUB_RAW" "$USE_FILE_RANGES" >> "$RESOLVED_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$VM_NAME" "$VM_ID" "$VM_LOCATION" "$SUB_ID" "$RG" "$SUB_RAW" "$USE_FILE_RANGES" "$LINE_PORTS" >> "$RESOLVED_FILE"
 done < "$SPECS_FILE"
 
 [ -s "$RESOLVED_FILE" ] ||
@@ -504,11 +544,18 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
     fi
 
     awk -F '\t' -v loc="$LOCATION" -v subv="$SUB_ID" -v rg="$RG" \
-        '$3 == loc && $4 == subv && $5 == rg {print $1"\t"$2"\t"$6"\t"$7}' \
+        '$3 == loc && $4 == subv && $5 == rg {print $1"\t"$2"\t"$6"\t"$7"\t"$8}' \
         "$RESOLVED_FILE" > "${TMP_DIR}/group-vms.tsv"
 
     if [ "$CONFIGURE" = "true" ]; then
-        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES; do
+        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES LINE_PORTS; do
+            if [ -n "$LINE_PORTS" ]; then
+                ROW_PORTS_FILE="${TMP_DIR}/row-ports.txt"
+                split_semi "$LINE_PORTS" > "$ROW_PORTS_FILE"
+            else
+                ROW_PORTS_FILE="$PORTS_FILE"
+            fi
+
             printf '%s\n' \
                 "$(jq -nc \
                     --arg id "$VM_ID" \
@@ -519,7 +566,7 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                     --arg resourceGroup "$RG" \
                     --arg protocol "$PROTOCOL" \
                     --arg duration "$DURATION" \
-                    --slurpfile ports "$PORTS_FILE" \
+                    --slurpfile ports "$ROW_PORTS_FILE" \
                     --argjson ipRanges "$IP_RANGES_JSON" \
                     '
                     {
@@ -543,19 +590,26 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
         done < "${TMP_DIR}/group-vms.tsv"
     else
         if [ "$POLICY_EXISTS" != "true" ]; then
-            while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES; do
+            while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES LINE_PORTS; do
                 warn "No JIT policy '${POLICY_NAME}' found for VM '${VM_NAME}' (subscription ${SUB_RAW}, resource group ${RG}). Run with --configure first."
                 SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
             done < "${TMP_DIR}/group-vms.tsv"
             continue
         fi
 
-        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES; do
+        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES LINE_PORTS; do
             VM_PORTS_FILE="${TMP_DIR}/vm-ports.json"
             jq -c \
                 --arg id "$VM_ID" \
                 '(.properties.virtualMachines // []) | map(select(.id == $id)) | .[0].ports // []' \
                 "$POLICY_FILE" > "$VM_PORTS_FILE"
+
+            if [ -n "$LINE_PORTS" ]; then
+                ROW_PORTS_FILE="${TMP_DIR}/row-ports.txt"
+                split_semi "$LINE_PORTS" > "$ROW_PORTS_FILE"
+            else
+                ROW_PORTS_FILE="$PORTS_FILE"
+            fi
 
             while IFS= read -r REQ_PORT; do
                 PORT_CONFIG=$(
@@ -624,7 +678,7 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                       ]
                     }
                     ' >> "$PLAN_FILE"
-            done < "$PORTS_FILE"
+            done < "$ROW_PORTS_FILE"
         done < "${TMP_DIR}/group-vms.tsv"
     fi
 done < "$GROUPS_FILE"
