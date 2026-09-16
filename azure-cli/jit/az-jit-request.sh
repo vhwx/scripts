@@ -5,14 +5,17 @@
 #               VM access for SSH (22) and/or RDP (3389) on a given set of virtual
 #               machines, which may span multiple subscriptions and resource groups in
 #               a single run. Mirrors the Azure Portal's VM "Connect > Request access"
-#               flow via the ARM REST API: it reads each VM's existing JIT policy, uses
-#               the source IP ranges already configured on that policy (the "JIT
-#               configured IPs" option in the portal's Source IP address field) as the
-#               allowed source for the access request, and refuses to request access
-#               for any port still configured with "*" (Any) — that source setting must
-#               be a real, restricted set of IP ranges. Use --configure to create/update
-#               a VM's JIT policy with that standard collection of IP ranges in the
-#               first place.
+#               flow via the ARM REST API: by default it reads each VM's existing JIT
+#               policy and reuses the source IP ranges already configured on that
+#               policy (the "JIT configured IPs" option in the portal's Source IP
+#               address field) as the allowed source for the access request, refusing
+#               to request access for any port still configured with "*" (Any). An
+#               --input-file may also declare a standard collection of IP ranges once
+#               at the top (an "ip-ranges:" directive) and let individual VM rows opt
+#               into using it for their request instead of the policy's own ranges;
+#               rows that don't opt in keep using the JIT-configured ranges. Use
+#               --configure to create/update a VM's JIT policy with a standard
+#               collection of IP ranges in the first place.
 # Usage:        ./az-jit-request.sh --subscription <id> --resource-group <rg> \
 #                   --vm-names vm1,vm2 [--ports 22,3389] [--duration PT1H]
 #               ./az-jit-request.sh --input-file vms.csv --dry-run
@@ -100,16 +103,30 @@ Request mode (default) reads each VM's existing JIT policy and reuses whichever 
 IP ranges are already configured for the requested port(s) — this is the same as
 selecting "IP configured in JIT policy" for the Source IP address field in the Azure
 Portal's request-access dialog. Ports still configured with "*" (Any) are skipped with
-an error; run --configure on them first.
+an error unless the row opts into the file's ip-ranges (see below); run --configure on
+them first otherwise.
 
 Input file format (used with --input-file):
-  One "subscription,resource-group,vm-name" entry per line. Blank lines and lines
-  starting with # are ignored. "subscription" may be a subscription ID or display name.
-  This is how a single run can target VMs across different subscriptions and resource
-  groups; --subscription/--resource-group are not used in this mode.
+  One "subscription,resource-group,vm-name[,use-file-ip-ranges]" entry per line. Blank
+  lines and lines starting with # are ignored. "subscription" may be a subscription ID
+  or display name. This is how a single run can target VMs across different
+  subscriptions and resource groups; --subscription/--resource-group are not used in
+  this mode.
 
-    # subscription,resource-group,vm-name
-    Example-Sandbox-Subscription,example-rg,web-01
+  An optional "ip-ranges: cidr[,cidr...]" directive line (anywhere in the file, but
+  conventionally at the top) declares a standard collection of source IP ranges for
+  the file. It cannot be "*". Set the 4th column to yes/true/1 on a VM row to use that
+  collection as the request's source IP instead of the port's JIT-configured ranges;
+  leave it blank (or no/false/0) to keep using the JIT-configured ranges. A row that
+  opts in without a directive present falls back to the JIT-configured ranges with a
+  warning.
+
+    # Standard collection of IPs to request access from, shared by rows below
+    ip-ranges: 203.0.113.0/24,198.51.100.10/32
+
+    # subscription,resource-group,vm-name,use-file-ip-ranges
+    Example-Sandbox-Subscription,example-rg,web-01,yes
+    Example-Sandbox-Subscription,example-rg,web-02
     01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01
 
 Examples:
@@ -309,16 +326,26 @@ az account show >/dev/null 2>&1 ||
 
 # --- Collect the VM specs: subscription, resource group, and VM name ------------
 #
-# Each row is "subscriptionRaw<TAB>resourceGroup<TAB>vmName". subscriptionRaw is
-# whatever the user/file provided (ID or display name) and is resolved to a
-# subscription ID below, once per distinct value.
+# Each row is "subscriptionRaw<TAB>resourceGroup<TAB>vmName<TAB>useFileRanges".
+# subscriptionRaw is whatever the user/file provided (ID or display name) and is
+# resolved to a subscription ID below, once per distinct value. useFileRanges is
+# "true"/"false", set from the input file's optional per-row 4th column (see below);
+# --vm-names entries always get "false" since there is no file-level ip-ranges
+# directive outside of --input-file.
 
 SPECS_FILE="${TMP_DIR}/vm-specs.tsv"
 : > "$SPECS_FILE"
 
+# File-level "ip-ranges:" directive (--input-file only): a standard collection of
+# source IP ranges that individual VM rows can opt into using for their JIT request
+# instead of the port's own JIT-configured ranges.
+FILE_IP_RANGES_JSON='[]'
+FILE_IP_RANGES_RAW=""
+FILE_IP_RANGES_SET="false"
+
 if [ -n "$VM_NAMES_RAW" ]; then
     while IFS= read -r VM_NAME; do
-        printf '%s\t%s\t%s\n' "$SUBSCRIPTION" "$RESOURCE_GROUP" "$VM_NAME" >> "$SPECS_FILE"
+        printf '%s\t%s\t%s\t%s\n' "$SUBSCRIPTION" "$RESOURCE_GROUP" "$VM_NAME" "false" >> "$SPECS_FILE"
     done < <(split_csv "$VM_NAMES_RAW")
 else
     LINE_NUMBER=0
@@ -328,16 +355,68 @@ else
         LINE=$(printf '%s' "$RAW_LINE" | sed 's/#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -n "$LINE" ] || continue
 
+        case "$LINE" in
+            [Ii][Pp]-[Rr][Aa][Nn][Gg][Ee][Ss]:*)
+                if [ "$FILE_IP_RANGES_SET" = "true" ]; then
+                    warn "Line ${LINE_NUMBER}: duplicate ip-ranges directive ignored."
+                    continue
+                fi
+
+                DIRECTIVE_VALUE=$(printf '%s' "$LINE" | cut -d':' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+                if [ -z "$DIRECTIVE_VALUE" ]; then
+                    warn "Line ${LINE_NUMBER}: ip-ranges directive has no value, ignoring."
+                    continue
+                fi
+
+                DIRECTIVE_RANGES_FILE="${TMP_DIR}/file-ip-ranges.txt"
+                split_csv "$DIRECTIVE_VALUE" > "$DIRECTIVE_RANGES_FILE"
+
+                if [ ! -s "$DIRECTIVE_RANGES_FILE" ]; then
+                    warn "Line ${LINE_NUMBER}: ip-ranges directive produced an empty list, ignoring."
+                    continue
+                fi
+
+                while IFS= read -r RANGE_ITEM; do
+                    [ "$RANGE_ITEM" != "*" ] ||
+                        die "Line ${LINE_NUMBER}: ip-ranges directive cannot be \"*\" (Any). Provide one or more real CIDRs/IPs."
+                done < "$DIRECTIVE_RANGES_FILE"
+
+                FILE_IP_RANGES_RAW="$DIRECTIVE_VALUE"
+                FILE_IP_RANGES_JSON=$(jq -Rn '[inputs]' < "$DIRECTIVE_RANGES_FILE")
+                FILE_IP_RANGES_SET="true"
+                info "Input file ip-ranges directive: ${FILE_IP_RANGES_RAW}"
+                continue
+                ;;
+        esac
+
         LINE_SUBSCRIPTION=$(printf '%s' "$LINE" | cut -d',' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         LINE_RG=$(printf '%s' "$LINE" | cut -d',' -f2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        LINE_VM=$(printf '%s' "$LINE" | cut -d',' -f3- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        LINE_VM=$(printf '%s' "$LINE" | cut -d',' -f3 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        LINE_USE_RANGE_RAW=$(printf '%s' "$LINE" | cut -d',' -f4 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
         if [ -z "$LINE_SUBSCRIPTION" ] || [ -z "$LINE_RG" ] || [ -z "$LINE_VM" ]; then
-            warn "Line ${LINE_NUMBER}: expected \"subscription,resource-group,vm-name\", got: ${RAW_LINE}"
+            warn "Line ${LINE_NUMBER}: expected \"subscription,resource-group,vm-name[,use-file-ip-ranges]\", got: ${RAW_LINE}"
             continue
         fi
 
-        printf '%s\t%s\t%s\n' "$LINE_SUBSCRIPTION" "$LINE_RG" "$LINE_VM" >> "$SPECS_FILE"
+        LINE_USE_FILE_RANGES="false"
+        case "$LINE_USE_RANGE_RAW" in
+            ''|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]|0)
+                ;;
+            [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)
+                if [ "$FILE_IP_RANGES_SET" = "true" ]; then
+                    LINE_USE_FILE_RANGES="true"
+                else
+                    warn "Line ${LINE_NUMBER}: VM '${LINE_VM}' requests the file's ip-ranges, but no ip-ranges directive was found; using JIT-configured ranges instead."
+                fi
+                ;;
+            *)
+                warn "Line ${LINE_NUMBER}: unrecognized ip-ranges indicator \"${LINE_USE_RANGE_RAW}\" for VM '${LINE_VM}' (expected yes/no); using JIT-configured ranges."
+                ;;
+        esac
+
+        printf '%s\t%s\t%s\t%s\n' "$LINE_SUBSCRIPTION" "$LINE_RG" "$LINE_VM" "$LINE_USE_FILE_RANGES" >> "$SPECS_FILE"
     done < "$INPUT_FILE"
 fi
 
@@ -375,7 +454,7 @@ done < "${TMP_DIR}/subscriptions.txt"
 RESOLVED_FILE="${TMP_DIR}/resolved.tsv"
 : > "$RESOLVED_FILE"
 
-while IFS=$'\t' read -r SUB_RAW RG VM_NAME; do
+while IFS=$'\t' read -r SUB_RAW RG VM_NAME USE_FILE_RANGES; do
     SUB_ID=$(awk -F '\t' -v subv="$SUB_RAW" '$1 == subv {print $2; exit}' "$SUB_CACHE_FILE")
     [ -n "$SUB_ID" ] || continue
 
@@ -396,8 +475,8 @@ while IFS=$'\t' read -r SUB_RAW RG VM_NAME; do
         continue
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$VM_NAME" "$VM_ID" "$VM_LOCATION" "$SUB_ID" "$RG" "$SUB_RAW" >> "$RESOLVED_FILE"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$VM_NAME" "$VM_ID" "$VM_LOCATION" "$SUB_ID" "$RG" "$SUB_RAW" "$USE_FILE_RANGES" >> "$RESOLVED_FILE"
 done < "$SPECS_FILE"
 
 [ -s "$RESOLVED_FILE" ] ||
@@ -425,11 +504,11 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
     fi
 
     awk -F '\t' -v loc="$LOCATION" -v subv="$SUB_ID" -v rg="$RG" \
-        '$3 == loc && $4 == subv && $5 == rg {print $1"\t"$2"\t"$6}' \
+        '$3 == loc && $4 == subv && $5 == rg {print $1"\t"$2"\t"$6"\t"$7}' \
         "$RESOLVED_FILE" > "${TMP_DIR}/group-vms.tsv"
 
     if [ "$CONFIGURE" = "true" ]; then
-        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW; do
+        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES; do
             printf '%s\n' \
                 "$(jq -nc \
                     --arg id "$VM_ID" \
@@ -464,14 +543,14 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
         done < "${TMP_DIR}/group-vms.tsv"
     else
         if [ "$POLICY_EXISTS" != "true" ]; then
-            while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW; do
+            while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES; do
                 warn "No JIT policy '${POLICY_NAME}' found for VM '${VM_NAME}' (subscription ${SUB_RAW}, resource group ${RG}). Run with --configure first."
                 SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
             done < "${TMP_DIR}/group-vms.tsv"
             continue
         fi
 
-        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW; do
+        while IFS=$'\t' read -r VM_NAME VM_ID SUB_RAW USE_FILE_RANGES; do
             VM_PORTS_FILE="${TMP_DIR}/vm-ports.json"
             jq -c \
                 --arg id "$VM_ID" \
@@ -491,23 +570,29 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                     continue
                 fi
 
-                PREFIXES=$(
-                    printf '%s' "$PORT_CONFIG" | jq -c '
-                        if (.allowedSourceAddressPrefixes // []) != []
-                        then .allowedSourceAddressPrefixes
-                        elif (.allowedSourceAddressPrefix // "") != ""
-                        then [.allowedSourceAddressPrefix]
-                        else []
-                        end
-                    '
-                )
+                if [ "$USE_FILE_RANGES" = "true" ]; then
+                    # Row opted into the input file's "ip-ranges:" directive: use it
+                    # as-is, regardless of what the policy itself has configured.
+                    PREFIXES="$FILE_IP_RANGES_JSON"
+                else
+                    PREFIXES=$(
+                        printf '%s' "$PORT_CONFIG" | jq -c '
+                            if (.allowedSourceAddressPrefixes // []) != []
+                            then .allowedSourceAddressPrefixes
+                            elif (.allowedSourceAddressPrefix // "") != ""
+                            then [.allowedSourceAddressPrefix]
+                            else []
+                            end
+                        '
+                    )
 
-                HAS_WILDCARD=$(printf '%s' "$PREFIXES" | jq -r 'map(select(. == "*")) | length')
+                    HAS_WILDCARD=$(printf '%s' "$PREFIXES" | jq -r 'map(select(. == "*")) | length')
 
-                if [ "$PREFIXES" = "[]" ] || [ "$HAS_WILDCARD" != "0" ]; then
-                    warn "VM '${VM_NAME}': port ${REQ_PORT} is configured with source IP \"*\" (Any). Refusing to request access — run --configure with real --ip-ranges first."
-                    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                    continue
+                    if [ "$PREFIXES" = "[]" ] || [ "$HAS_WILDCARD" != "0" ]; then
+                        warn "VM '${VM_NAME}': port ${REQ_PORT} is configured with source IP \"*\" (Any). Refusing to request access — run --configure with real --ip-ranges first, or opt this row into the input file's ip-ranges directive."
+                        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                        continue
+                    fi
                 fi
 
                 jq -nc \
@@ -520,6 +605,7 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                     --arg duration "$DURATION" \
                     --argjson port "$REQ_PORT" \
                     --argjson prefixes "$PREFIXES" \
+                    --argjson usedFileRanges "$([ "$USE_FILE_RANGES" = "true" ] && echo true || echo false)" \
                     '
                     {
                       vmName: $name,
@@ -528,6 +614,7 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                       subscriptionId: $subscriptionId,
                       subscriptionDisplay: $subscriptionDisplay,
                       resourceGroup: $resourceGroup,
+                      usedFileRanges: $usedFileRanges,
                       ports: [
                         {
                           number: $port,
@@ -569,7 +656,11 @@ while IFS= read -r PLAN_LINE; do
     else
         P_PORT=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].number')
         P_PREFIXES=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].allowedSourceAddressPrefixes | join(",")')
-        info "  ${P_NAME} (${P_SUB}/${P_RG}): port ${P_PORT} -> source ${P_PREFIXES}, duration ${DURATION}"
+        P_SOURCE_LABEL="JIT policy"
+        if [ "$(printf '%s' "$PLAN_LINE" | jq -r '.usedFileRanges')" = "true" ]; then
+            P_SOURCE_LABEL="input file ip-ranges"
+        fi
+        info "  ${P_NAME} (${P_SUB}/${P_RG}): port ${P_PORT} -> source ${P_PREFIXES} (${P_SOURCE_LABEL}), duration ${DURATION}"
     fi
 done < "$PLAN_FILE"
 

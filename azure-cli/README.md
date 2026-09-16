@@ -30,12 +30,15 @@ _No scripts yet._
   single run. Reuses each VM's already configured JIT source IP ranges as the
   request's source (the "IP configured in JIT policy" option in the portal), refusing
   to request access for any port still set to `*` (Any). Supports `--input-file` (see
-  [`jit/vms.example.csv`](jit/vms.example.csv), one `subscription,resource-group,vm-name`
-  entry per line) to target VMs across scopes, or `--vm-names` for a single
-  subscription/resource group. `--configure` creates/updates a VM's JIT policy with a
-  standard collection of allowed source IP ranges (via `--ip-ranges`, which also cannot
-  be `*`) and a maximum request duration. Supports `--dry-run` to preview
-  requests/policy updates without submitting them.
+  [`jit/vms.example.csv`](jit/vms.example.csv), one
+  `subscription,resource-group,vm-name[,use-file-ip-ranges]` entry per line) to target
+  VMs across scopes, or `--vm-names` for a single subscription/resource group. The
+  input file may also declare a shared `ip-ranges: cidr[,cidr...]` collection (also
+  never `*`) that individual rows opt into via the 4th column, overriding the port's
+  JIT-configured ranges for that request only. `--configure` creates/updates a VM's
+  JIT policy with a standard collection of allowed source IP ranges (via
+  `--ip-ranges`, which also cannot be `*`) and a maximum request duration. Supports
+  `--dry-run` to preview requests/policy updates without submitting them.
 
 ### pim
 
