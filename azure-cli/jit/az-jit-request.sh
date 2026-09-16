@@ -787,7 +787,18 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
     if [ "$CONFIGURE" = "true" ]; then
         POLICY_FILE="${TMP_DIR}/policy-${SUB_ID}-${RG}-${LOCATION}.json"
 
-        NEW_VMS_JSON=$(jq -s '.' "$GROUP_PLAN")
+        # Merge by VM id: if the same VM appears on more than one input-file row
+        # (e.g. one row per port), union their ports instead of sending Azure two
+        # separate entries for the same VM id, which it rejects outright.
+        NEW_VMS_JSON=$(
+            jq -sc '
+                group_by(.id)
+                | map({
+                    id: .[0].id,
+                    ports: (map(.ports) | flatten | unique_by(.number))
+                  })
+            ' "$GROUP_PLAN"
+        )
 
         MERGED_BODY=$(
             jq -n \
