@@ -53,6 +53,11 @@
 
 set -u
 
+# Captured before the option-parsing loop below consumes "$@" via shift, so that
+# --configure-and-request can re-invoke this same script twice (once per step) with
+# the original arguments intact.
+ORIGINAL_ARGS=("$@")
+
 API_VERSION="2020-01-01"
 DEFAULT_PORTS="22,3389"
 DEFAULT_PROTOCOL="*"
@@ -71,6 +76,7 @@ DURATION_SET_BY_USER="false"
 POLICY_NAME="$DEFAULT_POLICY_NAME"
 PROTOCOL="$DEFAULT_PROTOCOL"
 CONFIGURE="false"
+CONFIGURE_AND_REQUEST="false"
 AUTO_CONFIRM="false"
 DRY_RUN="false"
 
@@ -103,6 +109,13 @@ Options:
                             allowed request duration, default: ${DEFAULT_CONFIGURE_DURATION}
   --policy-name NAME      JIT policy name, default: ${DEFAULT_POLICY_NAME}
   --configure             Create/update the JIT policy instead of requesting access
+  --configure-and-request Do both, in order: first --configure the JIT policy with
+                            --ip-ranges (or the input file's ip-ranges: directive),
+                            then request access using that same range — mirrors doing
+                            "Edit settings > Save" followed by "Request access" in the
+                            Portal in one command. Mutually exclusive with --configure.
+                            Internally re-invokes this script once per step, so each
+                            step gets its own confirmation prompt unless --yes is set.
   --ip-ranges LIST        Configure mode only: comma-separated CIDRs/IPs to set as the
                             allowed source IPs, e.g. 203.0.113.0/24,198.51.100.10/32.
                             Cannot be "*" — the whole point of this script is to avoid
@@ -124,6 +137,16 @@ accepts a specific range as a valid subset of a "*" policy. The requested --dura
 is likewise automatically capped down to a port's own maxRequestAccessDuration (with
 a warning) if it's shorter than the requested/default duration, since Azure otherwise
 rejects the whole request as not being a subset of the policy.
+
+Note that "Any specific range is a valid subset of a JIT policy" only holds when the
+policy's port is configured with "*" (Any). If the port is instead configured with
+its own specific preset ranges (e.g. a governance-defined default) and you want to
+request access from a *different* range than that preset, Azure will reject the
+request as not a subset of the policy — because the request can only narrow within
+what the policy already allows, never introduce new ranges. To replace a preset with
+your own range, use --configure (or --configure-and-request) to update the policy
+itself first, exactly like clicking "Edit settings > Save" in the Portal before
+"Request access".
 
 Input file format (used with --input-file):
   One "subscription,resource-group,vm-name[,use-file-ip-ranges][,ports]" entry per
@@ -164,6 +187,11 @@ Examples:
   ${PROGRAM_NAME} --subscription my-sub --resource-group example-rg \\
       --vm-names web-01,web-02 --configure \\
       --ip-ranges 203.0.113.0/24,198.51.100.10/32 --duration PT3H
+
+  ${PROGRAM_NAME} --input-file vms.csv --ports 22 --configure-and-request \\
+      --duration PT2H
+      (replaces each VM's governance-preset JIT source IPs with the file's
+      ip-ranges: directive, then immediately requests access using that range)
 EOF
 }
 
@@ -273,6 +301,10 @@ while [ "$#" -gt 0 ]; do
             CONFIGURE="true"
             shift
             ;;
+        --configure-and-request)
+            CONFIGURE_AND_REQUEST="true"
+            shift
+            ;;
         --yes)
             AUTO_CONFIRM="true"
             shift
@@ -297,6 +329,28 @@ fi
 
 if [ -z "$VM_NAMES_RAW" ] && [ -z "$INPUT_FILE" ]; then
     die "Provide VMs via --vm-names or --input-file."
+fi
+
+if [ "$CONFIGURE_AND_REQUEST" = "true" ]; then
+    [ "$CONFIGURE" = "false" ] || die "--configure-and-request cannot be combined with --configure."
+
+    # Re-invoke this same script twice with the original arguments: once with
+    # --configure to replace the policy's configured IP ranges, then again without
+    # it to request access — the same two ARM calls the Portal makes for "Edit
+    # settings > Save" followed by "Request access", just chained automatically so
+    # the request step always runs against the range we just configured.
+    CHAIN_ARGS=()
+    for CHAIN_ARG in "${ORIGINAL_ARGS[@]}"; do
+        [ "$CHAIN_ARG" = "--configure-and-request" ] || CHAIN_ARGS+=("$CHAIN_ARG")
+    done
+
+    info "=== Step 1/2: configuring JIT policy with the requested IP ranges ==="
+    "$0" "${CHAIN_ARGS[@]}" --configure ||
+        die "Configure step failed; aborting before requesting access."
+
+    info ""
+    info "=== Step 2/2: requesting JIT access ==="
+    exec "$0" "${CHAIN_ARGS[@]}"
 fi
 
 if [ -n "$VM_NAMES_RAW" ]; then
@@ -890,12 +944,28 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
     else
         INITIATE_URI="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Security/locations/${LOCATION}/jitNetworkAccessPolicies/${POLICY_NAME}/initiate?api-version=${API_VERSION}"
 
+        # The /initiate endpoint's port schema (JitNetworkAccessRequestPort, same
+        # 2020-01-01 API version as the policy itself) accepts a plural
+        # "allowedSourceAddressPrefixes" array field, mutually exclusive with the
+        # singular "allowedSourceAddressPrefix" string field, which must be a single
+        # IP/CIDR. A previous version of this script collapsed multiple ranges into
+        # one comma-separated string and sent it as the singular field, which Azure
+        # rejects with "InvalidInitiateInput ... must be a valid IPv4 Address
+        # Prefix" because a comma-separated list isn't a valid single prefix. Send
+        # the array as-is instead.
         REQUEST_BODY=$(
             jq -s \
                 '{
                    virtualMachines: map({
                      id: .id,
-                     ports: [.ports[0]]
+                     ports: [
+                       .ports[0] as $p |
+                       {
+                         number: $p.number,
+                         allowedSourceAddressPrefixes: $p.allowedSourceAddressPrefixes,
+                         duration: $p.duration
+                       }
+                     ]
                    })
                  }' \
                 "$GROUP_PLAN"

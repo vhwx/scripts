@@ -7,25 +7,63 @@
 # this mode.
 #
 # An optional "ip-ranges: cidr[,cidr...]" directive (shown below) declares a standard
-# collection of source IP ranges for the file. It cannot be "*". Set the 4th column to
-# yes/true/1 on a VM row to request access from that collection instead of the port's
-# own JIT-configured ranges; leave it blank (or no/false/0) to keep using the
-# JIT-configured ranges.
+# collection of source IP ranges for the file. It cannot be "*".
+#
+# Workflow: to REPLACE a VM's existing (e.g. governance-preset) JIT source IPs with
+# your own range and then request access, run this file with --configure-and-request
+# (recommended — does both steps in the correct order in one command):
+#   ./az-jit-request.sh --input-file vms.example.csv --ports 22 --configure-and-request
+# This first --configures the policy with the ip-ranges: directive below (equivalent
+# to "Edit settings > Save" in the Portal), then requests access using that same
+# range (equivalent to "Request access"). Azure only allows a request whose source
+# IPs are a subset of what the policy currently has configured, so skipping the
+# --configure step (or requesting a range the policy doesn't already allow) fails
+# with "not a subset of policy".
+#
+# Once a VM's policy is configured this way, leave the 4th column blank/no on its
+# row — the plain request step (no --configure) already reuses whatever is
+# configured on the policy, which is now your own range. Only set the 4th column to
+# yes/true/1 if you instead want to narrow down a port that's deliberately left at
+# "*" (Any) in its policy WITHOUT reconfiguring it (Azure always accepts a specific
+# range as a valid subset of "*"); this only works as a plain request (no
+# --configure-and-request), since --configure never sets the policy itself to "*".
+#
+# Each entry in the comma-separated ip-ranges list must be a single IP address or a
+# CIDR-notation range (network address + "/" + prefix length), e.g. "10.0.5.4" (a
+# single host, equivalent to "10.0.5.4/32"), "198.51.100.10/32" (a single host
+# written explicitly), or "203.0.113.0/24" (a /24 subnet). Azure's JIT API only
+# accepts CIDR prefix lengths — plain dotted-decimal subnet masks like
+# "255.255.255.0" aren't supported, so express subnets as "/24", "/28", etc. The
+# script sends every entry in the list as-is to Azure, so mix as many individual
+# IPs and ranges as you need.
 #
 # The optional 5th column overrides which port(s) that row requests/configures, as a
 # semicolon-separated list, e.g. "22" or "22;3389" (semicolons, not commas — commas
 # are already the field separator). Leave it blank to use the global --ports list.
 #
 # Example usage:
+#   ./az-jit-request.sh --input-file vms.example.csv --ports 22 --configure-and-request --dry-run
+#       (replaces the VMs' preset JIT source IPs with the ip-ranges: directive below,
+#       then requests access using that same range — the recommended workflow)
 #   ./az-jit-request.sh --input-file vms.example.csv --ports 22,3389 --dry-run
+#       (plain request only, reusing whatever is already configured on each policy)
 #   ./az-jit-request.sh --input-file vms.example.csv --configure --dry-run
-#       (uses the ip-ranges: directive below as --ip-ranges automatically; pass
-#       --ip-ranges explicitly to override it for this run)
+#       (configure only; uses the ip-ranges: directive below as --ip-ranges
+#       automatically; pass --ip-ranges explicitly to override it for this run)
 
-# Standard collection of IPs to request access from, shared by rows below
-ip-ranges: 203.0.113.0/24,198.51.100.10/32
+# Standard collection of IPs to request access from, shared by rows below: a /24
+# subnet, a /28 subnet, a single host written explicitly as /32, and a single host
+# written without a prefix (implicitly /32).
+ip-ranges: 203.0.113.0/24,198.51.100.0/28,198.51.100.10/32,192.0.2.5
 
 # subscription,resource-group,vm-name,use-file-ip-ranges,ports
-Example-Sandbox-Subscription,example-rg,web-01,yes,22
+#
+# web-01/web-02: 4th column left blank — after --configure-and-request sets the
+# policy's own IPs to the ip-ranges: directive above, a plain request already reuses
+# them, so no per-row override is needed.
+# app-vm-01: 4th column set to "yes" — this VM's policy is deliberately left at "*"
+# (Any) and isn't being reconfigured; this narrows an ad hoc request down to the
+# file's ip-ranges directive without touching the policy itself.
+Example-Sandbox-Subscription,example-rg,web-01,,22
 Example-Sandbox-Subscription,example-rg,web-02,,3389
-01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01,,22;3389
+01b0eec7-4e50-47fb-9b3b-47706b34e504,other-rg,app-vm-01,yes,22;3389
