@@ -48,3 +48,17 @@ script, grouped by topic subfolder. When you add a script, add a matching entry 
   scripts are reusable as examples, not one-offs.
 - No secrets or credentials committed — use placeholders (e.g. `<subscription-id>`) and
   environment variables/prompts instead.
+
+## Linting
+
+CI runs linters automatically on pull requests and pushes that touch scripts:
+
+- **Bash / Azure CLI** (`bash/**/*.sh`, `azure-cli/**/*.sh`, `templates/**/*.sh`): checked with
+  [ShellCheck](https://www.shellcheck.net/) (`.github/workflows/shellcheck.yml`). Run it locally
+  with `shellcheck path/to/script.sh`.
+- **PowerShell** (`powershell/**/*.ps1`, `templates/**/*.ps1`): checked with
+  [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer)
+  (`.github/workflows/psscriptanalyzer.yml`). Run it locally with
+  `Invoke-ScriptAnalyzer -Path path/to/script.ps1`.
+
+Fix reported warnings/errors before merging.
