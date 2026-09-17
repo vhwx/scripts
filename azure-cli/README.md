@@ -44,7 +44,9 @@ _No scripts yet._
   with a standard collection of allowed source IP
   ranges (via `--ip-ranges`, which also cannot be `*`, or falling back to the input
   file's `ip-ranges:` directive if `--ip-ranges` isn't given) and a maximum request
-  duration. Supports
+  duration. The requested `--duration` is automatically capped down to a port's own
+  configured maximum when it's shorter, since Azure rejects any request whose IP
+  ranges or duration aren't a subset of the policy. Supports
   `--dry-run` to preview requests/policy updates without submitting them.
 
 ### pim

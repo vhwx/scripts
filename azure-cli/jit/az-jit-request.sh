@@ -23,6 +23,9 @@
 #               set the policy itself to "*", since you control it directly here); the
 #               same --input-file "ip-ranges:" directive also doubles as the default
 #               --ip-ranges for --configure when it isn't given on the command line.
+#               The requested duration is likewise automatically capped down to a
+#               port's own configured maximum when needed, since Azure rejects any
+#               request whose IP ranges or duration aren't a subset of the policy.
 # Usage:        ./az-jit-request.sh --subscription <id> --resource-group <rg> \
 #                   --vm-names vm1,vm2 [--ports 22,3389] [--duration PT1H]
 #               ./az-jit-request.sh --input-file vms.csv --dry-run
@@ -94,7 +97,9 @@ Options:
   --ports LIST            Comma-separated TCP ports, default: ${DEFAULT_PORTS}. Can be
                             overridden per row in --input-file (see below)
   --duration ISO8601      Request mode: requested access duration, default:
-                            ${DEFAULT_REQUEST_DURATION}. Configure mode: maximum
+                            ${DEFAULT_REQUEST_DURATION}, automatically capped down to
+                            a port's own configured maximum if that's shorter.
+                            Configure mode: maximum
                             allowed request duration, default: ${DEFAULT_CONFIGURE_DURATION}
   --policy-name NAME      JIT policy name, default: ${DEFAULT_POLICY_NAME}
   --configure             Create/update the JIT policy instead of requesting access
@@ -115,7 +120,10 @@ Portal's request-access dialog. If a port is configured with "*" (Any) — for e
 on a VM you don't control the JIT policy of — the request is still submitted using
 "*" as-is (with a warning), or you can opt the row into the input file's ip-ranges
 directive (see below) to narrow the request down to a real range instead; Azure always
-accepts a specific range as a valid subset of a "*" policy.
+accepts a specific range as a valid subset of a "*" policy. The requested --duration
+is likewise automatically capped down to a port's own maxRequestAccessDuration (with
+a warning) if it's shorter than the requested/default duration, since Azure otherwise
+rejects the whole request as not being a subset of the policy.
 
 Input file format (used with --input-file):
   One "subscription,resource-group,vm-name[,use-file-ip-ranges][,ports]" entry per
@@ -194,6 +202,23 @@ split_csv() {
 # column, since commas are already the field delimiter there) the same way.
 split_semi() {
     printf '%s' "$1" | tr ';' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true
+}
+
+# Converts a (limited) ISO 8601 duration such as "PT1H", "PT30M", "PT1H30M", or "P1D"
+# into a whole number of seconds on stdout. Returns non-zero (no output) if the value
+# doesn't match the supported subset (date/time designators D/H/M/S only — no
+# weeks/months/years, which JIT durations don't use).
+iso8601_duration_to_seconds() {
+    local dur="$1"
+    if [[ "$dur" =~ ^P(([0-9]+)D)?(T(([0-9]+)H)?(([0-9]+)M)?(([0-9]+)S)?)?$ ]]; then
+        local days="${BASH_REMATCH[2]:-0}"
+        local hours="${BASH_REMATCH[5]:-0}"
+        local minutes="${BASH_REMATCH[7]:-0}"
+        local seconds="${BASH_REMATCH[9]:-0}"
+        echo $(( days * 86400 + hours * 3600 + minutes * 60 + seconds ))
+        return 0
+    fi
+    return 1
 }
 
 while [ "$#" -gt 0 ]; do
@@ -682,6 +707,25 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                     fi
                 fi
 
+                # The requested duration must also be a subset of (i.e. not exceed)
+                # the port's own maxRequestAccessDuration, or Azure rejects the whole
+                # request as "not a subset of policy" — same rule as the source IP
+                # ranges above, just for duration instead. Cap it down automatically
+                # (with a warning) rather than failing outright, mirroring what the
+                # Portal does by capping the selectable duration to the policy max.
+                EFFECTIVE_DURATION="$DURATION"
+                PORT_MAX_DURATION=$(printf '%s' "$PORT_CONFIG" | jq -r '.maxRequestAccessDuration // empty')
+
+                if [ -n "$PORT_MAX_DURATION" ]; then
+                    REQ_SECONDS=$(iso8601_duration_to_seconds "$DURATION") || REQ_SECONDS=""
+                    MAX_SECONDS=$(iso8601_duration_to_seconds "$PORT_MAX_DURATION") || MAX_SECONDS=""
+
+                    if [ -n "$REQ_SECONDS" ] && [ -n "$MAX_SECONDS" ] && [ "$REQ_SECONDS" -gt "$MAX_SECONDS" ]; then
+                        warn "VM '${VM_NAME}': port ${REQ_PORT} allows at most ${PORT_MAX_DURATION} per request; requesting ${PORT_MAX_DURATION} instead of ${DURATION}."
+                        EFFECTIVE_DURATION="$PORT_MAX_DURATION"
+                    fi
+                fi
+
                 jq -nc \
                     --arg id "$VM_ID" \
                     --arg name "$VM_NAME" \
@@ -689,7 +733,7 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                     --arg subscriptionId "$SUB_ID" \
                     --arg subscriptionDisplay "$SUB_RAW" \
                     --arg resourceGroup "$RG" \
-                    --arg duration "$DURATION" \
+                    --arg duration "$EFFECTIVE_DURATION" \
                     --argjson port "$REQ_PORT" \
                     --argjson prefixes "$PREFIXES" \
                     --argjson usedFileRanges "$([ "$USE_FILE_RANGES" = "true" ] && echo true || echo false)" \
@@ -743,11 +787,12 @@ while IFS= read -r PLAN_LINE; do
     else
         P_PORT=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].number')
         P_PREFIXES=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].allowedSourceAddressPrefixes | join(",")')
+        P_DURATION=$(printf '%s' "$PLAN_LINE" | jq -r '.ports[0].duration')
         P_SOURCE_LABEL="JIT policy"
         if [ "$(printf '%s' "$PLAN_LINE" | jq -r '.usedFileRanges')" = "true" ]; then
             P_SOURCE_LABEL="input file ip-ranges"
         fi
-        info "  ${P_NAME} (${P_SUB}/${P_RG}): port ${P_PORT} -> source ${P_PREFIXES} (${P_SOURCE_LABEL}), duration ${DURATION}"
+        info "  ${P_NAME} (${P_SUB}/${P_RG}): port ${P_PORT} -> source ${P_PREFIXES} (${P_SOURCE_LABEL}), duration ${P_DURATION}"
     fi
 done < "$PLAN_FILE"
 
