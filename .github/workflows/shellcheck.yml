@@ -2,17 +2,27 @@ name: ShellCheck
 
 on:
   push:
+    branches: [main]
     paths:
       - "bash/**/*.sh"
       - "azure-cli/**/*.sh"
       - "templates/**/*.sh"
       - ".github/workflows/shellcheck.yml"
   pull_request:
+    branches: [main]
     paths:
       - "bash/**/*.sh"
       - "azure-cli/**/*.sh"
       - "templates/**/*.sh"
       - ".github/workflows/shellcheck.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: shellcheck-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   shellcheck:
