@@ -15,7 +15,8 @@ azure-cli/<topic>/*.sh
 templates/            # starter templates with the required header format
 ```
 
-Each language folder has its own `README.md` that indexes the scripts it contains, grouped by
+Each script has its own `README.md` next to it, with a short description and a Quickstart
+usage example. Each language folder has its own `README.md` that links to those, grouped by
 topic subfolder. A new language/platform gets its own top-level folder following the same
 `<language>/<topic>/<script>` pattern and its own `README.md` index.
 
@@ -39,4 +40,5 @@ topic subfolder. A new language/platform gets its own top-level folder following
 1. Place it under the correct `<language>/<topic>/` folder (reuse an existing topic before
    creating a new one).
 2. Base it on the matching template in `templates/`.
-3. Add a one-line entry to that language folder's `README.md` index.
+3. Add a `README.md` next to it with a Quickstart example.
+4. Link it from that language folder's `README.md` index.

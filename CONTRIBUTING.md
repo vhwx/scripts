@@ -35,10 +35,12 @@ Required fields: **Description**, **Usage**, **Requirements**, **Author**, **Dat
 Azure CLI scripts additionally note the **required `az` extensions or subscription/permissions**
 in the Requirements field.
 
-## Documentation index
+## Documentation
 
-Each language folder has its own `README.md` listing the scripts it contains, one line per
-script, grouped by topic subfolder. When you add a script, add a matching entry there.
+Each script gets its own `README.md` in the same folder, with a short description and a
+Quickstart usage example (see `azure-cli/jit/README.md` or `bash/system/README.md`). Each
+language folder's `README.md` is just an index linking to those — add an entry there when you
+add a script.
 
 ## Style
 

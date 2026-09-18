@@ -1,17 +1,7 @@
 # Bash
 
-Bash / POSIX shell scripts, organized by topic.
+Bash scripts by topic. Each script has its own README with usage examples.
 
-Follow [`templates/bash-template.sh`](../templates/bash-template.sh) for new scripts and see
-the root [CONTRIBUTING.md](../CONTRIBUTING.md) for naming and header conventions.
-
-## Index
-
-### system
-
-- [`system/disk-usage-report.sh`](system/disk-usage-report.sh) — Prints a sorted disk usage
-  report for a given directory.
-
-### networking
-
-_No scripts yet._
+- **system**
+  - [`system/disk-usage-report.sh`](system/README.md)
+- **networking** — _no scripts yet_
