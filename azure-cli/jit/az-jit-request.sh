@@ -953,6 +953,13 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
         # rejects with "InvalidInitiateInput ... must be a valid IPv4 Address
         # Prefix" because a comma-separated list isn't a valid single prefix. Send
         # the array as-is instead.
+        #
+        # The one exception is "*" (Any): Azure rejects "*" inside the plural
+        # allowedSourceAddressPrefixes array with "InvalidSourceAddressPrefixesInput
+        # ... To pass this value, use the 'allowedSourceAddressPrefix' field
+        # instead." This happens for VMs whose JIT policy already has "*" configured
+        # as the source (e.g. left at the "IP configured in JIT policy" default).
+        # Detect that single-element ["*"] case and switch to the singular field.
         REQUEST_BODY=$(
             jq -s \
                 '{
@@ -960,11 +967,20 @@ while IFS=$'\t' read -r LOCATION SUB_ID RG; do
                      id: .id,
                      ports: [
                        .ports[0] as $p |
-                       {
-                         number: $p.number,
-                         allowedSourceAddressPrefixes: $p.allowedSourceAddressPrefixes,
-                         duration: $p.duration
-                       }
+                       if ($p.allowedSourceAddressPrefixes == ["*"])
+                       then
+                         {
+                           number: $p.number,
+                           allowedSourceAddressPrefix: "*",
+                           duration: $p.duration
+                         }
+                       else
+                         {
+                           number: $p.number,
+                           allowedSourceAddressPrefixes: $p.allowedSourceAddressPrefixes,
+                           duration: $p.duration
+                         }
+                       end
                      ]
                    })
                  }' \
